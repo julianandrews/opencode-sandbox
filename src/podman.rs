@@ -57,6 +57,14 @@ pub struct PodmanArgs {
     args: Vec<String>,
 }
 
+/// The workspace name for a host path. `/` has no final component, so it
+/// becomes `root`; this also keeps `-m /` from panicking.
+fn path_basename(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "root".to_string())
+}
+
 impl PodmanArgs {
     pub fn new() -> Self {
         PodmanArgs { args: Vec::new() }
@@ -219,10 +227,7 @@ impl PodmanArgs {
 
     pub fn workspace(&mut self) -> Result<&mut Self> {
         let cwd = std::env::current_dir().context("failed to get current directory")?;
-        let basename = cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "root".to_string());
+        let basename = path_basename(&cwd);
 
         self.args.push("-v".into());
         self.args
@@ -309,10 +314,7 @@ impl PodmanArgs {
     pub fn extra_mounts(&mut self, mounts: &[String]) -> Result<&mut Self> {
         let cwd =
             std::env::current_dir().context("failed to get current directory for extra mounts")?;
-        let cwd_basename = cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "root".to_string());
+        let cwd_basename = path_basename(&cwd);
 
         let mut seen_targets = HashSet::from([cwd_basename]);
 
@@ -328,12 +330,7 @@ impl PodmanArgs {
             let resolved = path::resolve_path(host_path)
                 .with_context(|| format!("failed to resolve mount path '{}'", host_path))?;
 
-            let target = target_name.unwrap_or_else(|| {
-                resolved
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .expect("mount path has no filename")
-            });
+            let target = target_name.unwrap_or_else(|| path_basename(&resolved));
 
             if !seen_targets.insert(target.clone()) {
                 anyhow::bail!("duplicate mount target '/workspace/{}'", target);
@@ -1075,6 +1072,24 @@ mod tests {
         let args = da.into_vec();
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"127.0.0.1:8080:8080".to_string()));
+    }
+
+    #[test]
+    fn path_basename_handles_root_and_regular_paths() {
+        assert_eq!(path_basename(Path::new("/")), "root");
+        assert_eq!(path_basename(Path::new("/tmp/project")), "project");
+    }
+
+    #[test]
+    fn extra_mounts_accepts_root_without_target() {
+        // `/` has no final path component; it must mount as `root` rather than
+        // panicking (README documents that `/` is an accepted mount source).
+        let mut da = PodmanArgs::new();
+        da.extra_mounts(&["/".to_string()]).unwrap();
+        assert!(da
+            .into_vec()
+            .windows(2)
+            .any(|w| w == ["-v".to_string(), "/:/workspace/root".to_string()]));
     }
 
     #[test]
