@@ -1,10 +1,17 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 pub const R_LIB_SITE: &str = "/opt/r-library";
 
 pub const R_CRAN_REPO: &str = "https://cloud.r-project.org";
+
+/// Host directory shared as `R_LIBS_SITE` by the R setup container and the
+/// main run. Both use the XDG data dir, so a custom `XDG_DATA_HOME` keeps the
+/// library the setup installs into and the one the runtime reads in sync.
+pub fn site_library_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("opencode-sandbox/r-library")
+}
 
 /// XDG base dirs used by both opencode and R inside the container. Kept in one
 /// place so the run and R setup containers stay consistent.
@@ -35,4 +42,17 @@ pub fn r_user_dir_mounts() -> Result<Vec<(PathBuf, String)>> {
         (config, "/opencode/config/R".to_string()),
         (state, "/opencode/state/R".to_string()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn site_library_lives_under_the_data_dir() {
+        assert_eq!(
+            site_library_in(Path::new("/data")),
+            PathBuf::from("/data/opencode-sandbox/r-library")
+        );
+    }
 }

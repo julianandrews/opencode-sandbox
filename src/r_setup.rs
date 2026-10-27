@@ -29,9 +29,8 @@ pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Res
 
     println!("→ Ensuring R dependencies (renv.lock present)...");
 
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let r_lib_cache = home.join(".local/share/opencode-sandbox/r-library");
+    let data = dirs::data_dir().context("data dir required")?;
+    let r_lib_cache = r::site_library_in(&data);
     fs::create_dir_all(&r_lib_cache)?;
 
     let cwd_basename = cwd

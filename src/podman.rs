@@ -133,7 +133,7 @@ impl PodmanArgs {
             data.join("opencode/bin"),
             data.join("opentui"),
             state.join("opencode"),
-            data.join("opencode-sandbox/r-library"),
+            r::site_library_in(&data),
             data.join("opencode-sandbox/home"),
             // The built-in plan agent may only write plan files under
             // ~/.opencode/plan. Create it host-side (like the home itself) so
@@ -272,7 +272,7 @@ impl PodmanArgs {
 
     pub fn r_library(&mut self) -> Result<&mut Self> {
         let data = dirs::data_dir().context("data dir required")?;
-        let r_lib = data.join("opencode-sandbox/r-library");
+        let r_lib = r::site_library_in(&data);
 
         self.args.push("-e".into());
         self.args.push(format!("R_LIBS_SITE={}", r::R_LIB_SITE));
