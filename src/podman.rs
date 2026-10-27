@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -84,12 +85,19 @@ impl PodmanArgs {
         self
     }
 
-    /// `edit_config` is the deliberate `--edit-config` escape hatch: the config
-    /// files and the `plugins`/`node_modules` dirs are then left writable (no
-    /// read-only mounts) so config and plugins can be edited from inside the
-    /// container. `config_dir` is the host XDG config dir; it is injected so
-    /// the tests never touch the real one.
-    pub fn xdg_dirs(&mut self, config_dir: &Path, edit_config: bool) -> Result<&mut Self> {
+    /// `edit_config` is the deliberate `--edit-config` escape hatch: regular
+    /// config files are staged as writable copies and regular directories are
+    /// bind-mounted writable so config and plugins can be edited from inside
+    /// the container. `sync_config` copies the changes back after the run.
+    /// `config_dir` is the host XDG config dir and `staging` is the per-run
+    /// directory that becomes the container's `/opencode/config/opencode`;
+    /// both are injected so the tests never touch the real ones.
+    pub fn xdg_dirs(
+        &mut self,
+        config_dir: &Path,
+        edit_config: bool,
+        staging: &Path,
+    ) -> Result<ConfigPlan> {
         let config = config_dir.to_path_buf();
         let cache = dirs::cache_dir().context("cache dir required")?;
         let data = dirs::data_dir().context("data dir required")?;
@@ -102,14 +110,13 @@ impl PodmanArgs {
         };
 
         let dirs_to_create = [
-            // Created host-side so the bind mount is owned by the host user:
-            // Podman would otherwise create it as root and the container's
-            // non-root user could not write cli.json/service.json (V2 mounts
-            // the config dir read-write for its first-run tui.json migration).
+            // Created host-side so config entries (and the seed) are owned by
+            // the host user. The container gets a per-run staging tree mounted
+            // over this path, not the host directory itself.
             config.join("opencode"),
-            // The plugins dir and node_modules are created (and later mounted
-            // read-only) so writable targets for plugin code never exist in
-            // the container; see the mounts in xdg_dirs.
+            // The plugins dir and node_modules are created here so they exist
+            // as real, host-owned directories to mount (read-only in locked
+            // mode; writable only with --edit-config).
             config.join("opencode/plugins"),
             config.join("opencode/node_modules"),
             cache.join("opencode"),
@@ -147,25 +154,29 @@ impl PodmanArgs {
             "{}:/opencode/home",
             data.join("opencode-sandbox/home").display()
         ));
+        // The container's config dir is a per-run staging tree, not the host
+        // config dir. Every host entry is represented by a real file or
+        // directory there and bind-mounted over it, so a mount destination is
+        // never a symlink. Nix/Home Manager symlinks point at the store, whose
+        // target does not exist inside the container; mounting over the link
+        // itself fails with ENOENT, so the entry is materialized instead. This
+        // also means new files the sandbox creates never land in the host
+        // config dir; `sync_config` copies back only the intended ones.
         self.args.push("-v".into());
-        self.args.push(format!(
-            "{}:/opencode/config/opencode",
-            config.join("opencode").display()
-        ));
+        self.args
+            .push(format!("{}:/opencode/config/opencode", staging.display()));
         // Seed a default opencode config host-side when none exists yet (the
-        // host-side creation keeps the bind mount owned by the host user, like
-        // the dirs above). Every existing config entry is then mounted
-        // read-only, except the runtime-writable regular files cli.json,
-        // service.json and tui.json. Symlinked entries are read-only even
-        // with `--edit-config`: they point into the Nix store, so a writable
-        // mount could never work, and skipping the mount would expose a
-        // dangling symlink inside the container. This is what lets Nix manage
-        // the server config, CLI settings, sounds, agents, commands and skills
-        // with ordinary Home Manager symlinks.
-        let config_dir = config.join("opencode");
-        for mount in opencode_config_mounts(&config_dir, edit_config)? {
+        // host-side creation keeps the source owned by the host user, like the
+        // dirs above). Every existing entry is then materialized in the
+        // staging tree: read-only entries are bind-mounted ro, writable
+        // regular files are copied (a file bind mount would break atomic
+        // temp-file+rename writes) and writable directories are bind-mounted
+        // rw. Symlinked entries are always read-only.
+        let config_root = config.join("opencode");
+        let plan = opencode_config_mounts(&config_root, edit_config, staging)?;
+        for mount in &plan.mounts {
             self.args.push("-v".into());
-            self.args.push(mount);
+            self.args.push(mount.clone());
         }
         self.args.push("-v".into());
         self.args.push(format!(
@@ -192,7 +203,7 @@ impl PodmanArgs {
             "{}:/opencode/state/opencode",
             state.join("opencode").display()
         ));
-        Ok(self)
+        Ok(plan)
     }
 
     pub fn cargo_home(&mut self) -> Result<&mut Self> {
@@ -383,65 +394,88 @@ impl PodmanArgs {
     }
 }
 
-/// Entries that stay writable for the runtime when they are regular files.
+/// Regular files staged as writable copies for the runtime in locked mode.
 /// A symlink with one of these names is mounted read-only instead: its target
 /// lives in the Nix store, where writes fail.
 const RUNTIME_WRITABLE_CONFIG: &[&str] = &["cli.json", "service.json", "tui.json"];
 
 /// Recognized global config file names. opencode merges all of them, so all
-/// are mounted read-only; a directory squatting on one of these names is not a
-/// config file and is skipped.
+/// are read-only in locked mode (staged writable copies with `--edit-config`);
+/// a directory squatting on one of these names is not a config file and is
+/// skipped.
 const GLOBAL_CONFIG_FILES: &[&str] = &["opencode.jsonc", "opencode.json", "config.json"];
 
-/// Build the host-side read-only mounts for the global opencode config dir,
-/// creating the default config on first run if none exists yet.
+/// A regular config file staged as a writable copy for one run. `original` is
+/// the host content at staging time, used to detect concurrent host edits.
+struct WritableConfigFile {
+    name: OsString,
+    host: PathBuf,
+    original: Vec<u8>,
+}
+
+/// Everything needed to assemble the container's config dir for a run and to
+/// sync the intended writes back afterwards.
+#[derive(Default)]
+pub struct ConfigPlan {
+    mounts: Vec<String>,
+    initial: HashSet<OsString>,
+    writable: Vec<WritableConfigFile>,
+}
+
+/// Materialize the global opencode config dir in `staging` and build the
+/// bind mounts that expose it inside the container.
 ///
-/// In a locked run every existing entry is mounted read-only except regular
-/// `cli.json`, `service.json` and `tui.json`, which the TUI/server must be able
-/// to write. Symlinked entries are mounted read-only even with
-/// `--edit-config`: they point into the Nix store, so a writable mount could
-/// never work, and skipping the mount would expose a dangling symlink inside
-/// the container. Mounts are skipped for missing paths: mounting a nonexistent
-/// source would make Podman create a root-owned directory in the user's config
-/// tree.
-fn opencode_config_mounts(config_dir: &Path, edit_config: bool) -> Result<Vec<String>> {
+/// The staging dir is mounted at `/opencode/config/opencode`. Every existing
+/// entry becomes a real file or directory there (never a symlink), so the OCI
+/// runtime can create the mount target even when the host entry is a symlink
+/// into the Nix store. Regular files that must stay writable are copied into
+/// the staging tree (a file bind mount would break atomic temp-file+rename
+/// writes) and written back by `sync_config`.
+///
+/// In a locked run every entry is read-only except regular `cli.json`,
+/// `service.json` and `tui.json` (staged writable copies). `--edit-config`
+/// also makes regular files writable (staged copies) and regular directories
+/// writable (bind-mounted rw). Symlinks are always read-only: their target is
+/// in the Nix store. Entries with missing/broken sources are skipped.
+fn opencode_config_mounts(
+    config_dir: &Path,
+    edit_config: bool,
+    staging: &Path,
+) -> Result<ConfigPlan> {
     let _ = seed_opencode_config(config_dir);
 
     let entries = match fs::read_dir(config_dir) {
         Ok(entries) => entries,
         Err(err) => {
             eprintln!(
-                "Warning: could not read opencode config dir '{}' ({err:#}); skipping read-only config mounts.",
+                "Warning: could not read opencode config dir '{}' ({err:#}); running with an empty config dir.",
                 config_dir.display()
             );
-            return Ok(Vec::new());
+            return Ok(ConfigPlan::default());
         }
     };
 
     let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
     entries.sort_by_key(|entry| entry.file_name());
 
-    let mut mounts = Vec::new();
+    let mut plan = ConfigPlan {
+        initial: entries.iter().map(|entry| entry.file_name()).collect(),
+        ..ConfigPlan::default()
+    };
+
     for entry in entries {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
+        let display = name.to_string_lossy();
         let path = entry.path();
         let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
 
-        if edit_config && !is_symlink {
-            continue;
-        }
-        if !edit_config && !is_symlink && RUNTIME_WRITABLE_CONFIG.contains(&name.as_ref()) {
-            continue;
-        }
-        if GLOBAL_CONFIG_FILES.contains(&name.as_ref()) && path.is_dir() {
+        if GLOBAL_CONFIG_FILES.contains(&display.as_ref()) && path.is_dir() {
             continue;
         }
         if !path.exists() {
-            // Broken symlink: there is no readable target to mount, and
-            // mounting it would shadow the host entry.
+            // Broken symlink: there is no readable target to mount.
             eprintln!(
-                "Warning: '{}' is not a readable config entry; skipping its read-only mount.",
+                "Warning: '{}' is not a readable config entry; skipping its mount.",
                 path.display()
             );
             continue;
@@ -455,20 +489,302 @@ fn opencode_config_mounts(config_dir: &Path, edit_config: bool) -> Result<Vec<St
             Ok(source) => source,
             Err(err) => {
                 eprintln!(
-                    "Warning: could not resolve config entry '{}' ({err:#}); skipping its read-only mount.",
+                    "Warning: could not resolve config entry '{}' ({err:#}); skipping its mount.",
                     path.display()
                 );
                 continue;
             }
         };
+        let placeholder = staging.join(&name);
 
-        mounts.push(format!(
-            "{}:/opencode/config/opencode/{}:ro",
+        let writable_file = !is_symlink
+            && path.is_file()
+            && (edit_config || RUNTIME_WRITABLE_CONFIG.contains(&display.as_ref()));
+        if writable_file {
+            let original = fs::read(&path)
+                .with_context(|| format!("failed to read config entry '{}'", path.display()))?;
+            fs::write(&placeholder, &original)
+                .with_context(|| format!("failed to stage config entry '{}'", path.display()))?;
+            fs::set_permissions(&placeholder, fs::metadata(&path)?.permissions()).with_context(
+                || {
+                    format!(
+                        "failed to set permissions on staged config entry '{}'",
+                        placeholder.display()
+                    )
+                },
+            )?;
+            plan.writable.push(WritableConfigFile {
+                name,
+                host: path,
+                original,
+            });
+            continue;
+        }
+
+        if source.is_dir() {
+            fs::create_dir_all(&placeholder).with_context(|| {
+                format!(
+                    "failed to create config staging dir '{}'",
+                    placeholder.display()
+                )
+            })?;
+        } else {
+            fs::File::create(&placeholder).with_context(|| {
+                format!(
+                    "failed to create config staging file '{}'",
+                    placeholder.display()
+                )
+            })?;
+        }
+
+        // Writable directories exist only in --edit-config mode; regular files
+        // that are not staged above are read-only, as are all symlinks.
+        let read_only = is_symlink || !path.is_dir() || !edit_config;
+        plan.mounts.push(format!(
+            "{}:/opencode/config/opencode/{}:{}",
             source.display(),
-            name
+            display,
+            if read_only { "ro" } else { "rw" }
         ));
     }
-    Ok(mounts)
+
+    Ok(plan)
+}
+
+/// Write staged config changes back to the host.
+///
+/// Writable regular files are copied into `staging` by
+/// `opencode_config_mounts`; they are written back here unless the host copy
+/// changed during the run (the host wins). New top-level entries are copied
+/// back in `--edit-config` mode, and the runtime files are copied back in both
+/// modes. Symlinks and special files are never copied back. Deletions and
+/// renames of existing entries are not propagated: edit the host directly for
+/// structural changes.
+pub fn sync_config(
+    plan: &ConfigPlan,
+    config_dir: &Path,
+    edit_config: bool,
+    staging: &Path,
+) -> Result<()> {
+    for file in &plan.writable {
+        let staged_path = staging.join(&file.name);
+        let staged_meta = match fs::symlink_metadata(&staged_path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "Warning: '{}' was removed in the sandbox; leaving the host copy unchanged.",
+                    file.host.display()
+                );
+                continue;
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not inspect staged config entry '{}': {err:#}",
+                    staged_path.display()
+                );
+                continue;
+            }
+        };
+        if staged_meta.file_type().is_symlink() || !staged_meta.is_file() {
+            eprintln!(
+                "Warning: '{}' is no longer a regular file in the sandbox; not copying it back.",
+                staged_path.display()
+            );
+            continue;
+        }
+        let host_meta = match fs::symlink_metadata(&file.host) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "Warning: '{}' disappeared on the host during the run; not recreating it.",
+                    file.host.display()
+                );
+                continue;
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not inspect '{}': {err:#}",
+                    file.host.display()
+                );
+                continue;
+            }
+        };
+        if host_meta.file_type().is_symlink() {
+            eprintln!(
+                "Warning: '{}' became a symlink on the host; not overwriting it.",
+                file.host.display()
+            );
+            continue;
+        }
+        let staged = match fs::read(&staged_path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not read staged config entry '{}': {err:#}",
+                    staged_path.display()
+                );
+                continue;
+            }
+        };
+        let host = match fs::read(&file.host) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("Warning: could not read '{}': {err:#}", file.host.display());
+                continue;
+            }
+        };
+        if host != file.original {
+            eprintln!(
+                "Warning: '{}' changed on the host during the run; keeping the host version.",
+                file.host.display()
+            );
+            continue;
+        }
+        if staged == host {
+            continue;
+        }
+        // Replace the host file atomically; a failed/partial sync must never
+        // leave a torn config file behind.
+        let mut tmp = match tempfile::NamedTempFile::new_in(config_dir) {
+            Ok(tmp) => tmp,
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not create a temp file next to '{}': {err:#}",
+                    file.host.display()
+                );
+                continue;
+            }
+        };
+        if let Err(err) = tmp.write_all(&staged) {
+            eprintln!(
+                "Warning: could not write '{}' back: {err:#}",
+                file.host.display()
+            );
+            continue;
+        }
+        let _ = tmp.as_file().set_permissions(staged_meta.permissions());
+        if let Err(err) = tmp.persist(&file.host) {
+            eprintln!(
+                "Warning: could not replace '{}': {err}",
+                file.host.display()
+            );
+            continue;
+        }
+    }
+
+    let entries = match fs::read_dir(staging) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "Warning: could not read the config staging dir '{}': {err:#}",
+                staging.display()
+            );
+            return Ok(());
+        }
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        if plan.initial.contains(&name) {
+            continue;
+        }
+        let display = name.to_string_lossy();
+        let meta = match fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not inspect new config entry '{}': {err:#}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            eprintln!(
+                "Warning: not copying symlink '{}' back to the host config dir.",
+                entry.path().display()
+            );
+            continue;
+        }
+        if !edit_config && (!RUNTIME_WRITABLE_CONFIG.contains(&display.as_ref()) || !meta.is_file())
+        {
+            continue;
+        }
+        let dest = config_dir.join(&name);
+        if fs::symlink_metadata(&dest).is_ok() {
+            eprintln!(
+                "Warning: not copying new config entry '{}': it already exists on the host.",
+                dest.display()
+            );
+            continue;
+        }
+        let result = if meta.is_dir() {
+            copy_new_config_dir(&entry.path(), &dest)
+        } else if meta.is_file() {
+            fs::copy(entry.path(), &dest).map(|_| ()).with_context(|| {
+                format!(
+                    "failed to copy '{}' to '{}'",
+                    entry.path().display(),
+                    dest.display()
+                )
+            })
+        } else {
+            continue;
+        };
+        if let Err(err) = result {
+            eprintln!(
+                "Warning: could not copy new config entry '{}': {err:#}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a new config directory to the host, without overwriting
+/// anything that appeared there concurrently and without following or copying
+/// symlinks.
+fn copy_new_config_dir(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)
+        .with_context(|| format!("failed to create config dir '{}'", dest.display()))?;
+    if let Ok(meta) = fs::metadata(src) {
+        let _ = fs::set_permissions(dest, meta.permissions());
+    }
+    for entry in fs::read_dir(src)
+        .with_context(|| format!("failed to read staged config dir '{}'", src.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("failed to read staged config dir '{}'", src.display()))?;
+        let meta = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?;
+        if meta.file_type().is_symlink() {
+            eprintln!(
+                "Warning: not copying symlink '{}' back to the host config dir.",
+                entry.path().display()
+            );
+            continue;
+        }
+        let target = dest.join(entry.file_name());
+        if fs::symlink_metadata(&target).is_ok() {
+            eprintln!(
+                "Warning: not overwriting '{}' while copying a new config dir.",
+                target.display()
+            );
+            continue;
+        }
+        if meta.is_dir() {
+            copy_new_config_dir(&entry.path(), &target)?;
+        } else if meta.is_file() {
+            fs::copy(entry.path(), &target).with_context(|| {
+                format!(
+                    "failed to copy '{}' to '{}'",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+            let _ = fs::set_permissions(&target, meta.permissions());
+        }
+    }
+    Ok(())
 }
 
 /// Seed the default opencode config if none exists, logging a warning when
@@ -645,9 +961,7 @@ mod tests {
         // be mounted writable (the rootfs is read-only) and HOME pointed at it,
         // or ssh-keygen's default ~/.ssh write fails after the passwd fix.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = PodmanArgs::new();
-        da.xdg_dirs(tmp.path(), false).unwrap();
-        let args = da.into_vec();
+        let args = xdg_args(tmp.path(), false);
         assert!(
             args.windows(2)
                 .any(|w| w == ["-e".to_string(), "HOME=/opencode/home".to_string()]),
@@ -665,9 +979,7 @@ mod tests {
         // without this writable mount the worker fails silently and markdown/code
         // highlighting degrades to raw text for non-root runs.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = PodmanArgs::new();
-        da.xdg_dirs(tmp.path(), false).unwrap();
-        let args = da.into_vec();
+        let args = xdg_args(tmp.path(), false);
         assert!(
             args.iter().any(|a| a.ends_with(":/opencode/data/opentui")),
             "opentui data-path mount missing: {args:?}"
@@ -680,9 +992,7 @@ mod tests {
         // npm plugin surface (node_modules + manifests) is installed there, so
         // both must be read-only for agents in locked mode.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = PodmanArgs::new();
-        da.xdg_dirs(tmp.path(), false).unwrap();
-        let args = da.into_vec();
+        let args = xdg_args(tmp.path(), false);
         assert!(
             args.iter()
                 .any(|a| a.ends_with(":/opencode/config/opencode/plugins:ro")),
@@ -702,16 +1012,13 @@ mod tests {
     }
 
     #[test]
-    fn xdg_dirs_edit_config_skips_regular_readonly_mounts() {
-        // `--edit-config` is the deliberate escape hatch: regular config
-        // files, the plugins dir and the npm plugin surface are left writable
-        // (no ro mounts) so config and plugins can be edited from inside the
-        // container. Nix-managed symlinks are covered by the unit tests; they
-        // stay read-only even in this mode.
+    fn xdg_dirs_edit_config_mounts_regular_entries_writable() {
+        // `--edit-config` is the deliberate escape hatch: regular directories
+        // (plugins, node_modules, assets, agent, ...) are bind-mounted rw and
+        // regular files are staged as writable copies (a file bind mount would
+        // break atomic writes). Nix-managed symlinks stay read-only.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = PodmanArgs::new();
-        da.xdg_dirs(tmp.path(), true).unwrap();
-        let args = da.into_vec();
+        let args = xdg_args(tmp.path(), true);
         for forbidden in [
             "opencode.jsonc:ro",
             "opencode.json:ro",
@@ -722,9 +1029,43 @@ mod tests {
         ] {
             assert!(
                 !args.iter().any(|a| a.contains(forbidden)),
-                "'{forbidden}' mount should be skipped with --edit-config: {args:?}"
+                "'{forbidden}' mount should not be read-only with --edit-config: {args:?}"
             );
         }
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with(":/opencode/config/opencode/plugins:rw")),
+            "plugins should be writable with --edit-config: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with(":/opencode/config/opencode/node_modules:rw")),
+            "node_modules should be writable with --edit-config: {args:?}"
+        );
+        // Regular files are staged copies, not mounts, so they do not appear as
+        // config mount destinations at all.
+        for name in ["opencode.jsonc", "package.json"] {
+            let suffix = format!("/opencode/config/opencode/{name}:");
+            assert!(
+                !args.iter().any(|a| a.contains(&suffix)),
+                "{name} should be staged, not mounted: {args:?}"
+            );
+        }
+        // The host config dir is never bind-mounted read-write; the container
+        // gets a per-run staging tree instead.
+        let host_mount = format!(
+            "{}:/opencode/config/opencode",
+            tmp.path().join("opencode").display()
+        );
+        assert!(
+            !args.contains(&host_mount),
+            "host config dir must not be mounted: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with(":/opencode/config/opencode")),
+            "staging config dir mount missing: {args:?}"
+        );
     }
 
     #[test]
@@ -763,7 +1104,7 @@ mod tests {
     fn config_mounts_seed_default_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("opencode");
-        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        let mounts = plan_mounts(&dir, false);
         assert_eq!(mounts.len(), 1);
         assert!(mounts[0].ends_with(":/opencode/config/opencode/opencode.jsonc:ro"));
         assert!(mounts[0].starts_with(&dir.display().to_string()));
@@ -840,7 +1181,7 @@ mod tests {
         let dir = tmp.path().join("opencode");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("opencode.jsonc"), "{\"model\":\"x\"}").unwrap();
-        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        let mounts = plan_mounts(&dir, false);
         assert_eq!(mounts.len(), 1);
         assert!(mounts[0].ends_with(":/opencode/config/opencode/opencode.jsonc:ro"));
         assert_eq!(
@@ -858,7 +1199,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("opencode.json"), "{\"model\":\"y\"}").unwrap();
         fs::write(dir.join("config.json"), "{\"model\":\"c\"}").unwrap();
-        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        let mounts = plan_mounts(&dir, false);
         assert_eq!(mounts.len(), 2);
         assert!(mounts.iter().any(|m| m.ends_with("opencode.json:ro")));
         assert!(mounts.iter().any(|m| m.ends_with("config.json:ro")));
@@ -868,7 +1209,7 @@ mod tests {
         );
         // When a jsonc appears later it is mounted too, on top of the others.
         fs::write(dir.join("opencode.jsonc"), "{\"model\":\"z\"}").unwrap();
-        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        let mounts = plan_mounts(&dir, false);
         assert_eq!(mounts.len(), 3);
         assert!(mounts.iter().any(|m| m.ends_with("opencode.jsonc:ro")));
         assert_eq!(
@@ -884,7 +1225,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blocker = tmp.path().join("opencode");
         fs::write(&blocker, "x").unwrap();
-        assert!(opencode_config_mounts(&blocker, false).unwrap().is_empty());
+        assert!(plan_mounts(&blocker, false).is_empty());
     }
 
     #[test]
@@ -895,13 +1236,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("opencode");
         fs::create_dir_all(dir.join("opencode.jsonc")).unwrap();
-        assert!(opencode_config_mounts(&dir, false).unwrap().is_empty());
+        assert!(plan_mounts(&dir, false).is_empty());
     }
 
     fn has_mount(mounts: &[String], name: &str) -> bool {
         mounts
             .iter()
             .any(|m| m.ends_with(&format!(":/opencode/config/opencode/{name}:ro")))
+    }
+
+    fn has_rw_mount(mounts: &[String], name: &str) -> bool {
+        mounts
+            .iter()
+            .any(|m| m.ends_with(&format!(":/opencode/config/opencode/{name}:rw")))
+    }
+
+    fn plan_mounts(dir: &Path, edit_config: bool) -> Vec<String> {
+        let staging = tempfile::tempdir().unwrap();
+        opencode_config_mounts(dir, edit_config, staging.path())
+            .unwrap()
+            .mounts
+    }
+
+    fn xdg_args(config_dir: &Path, edit_config: bool) -> Vec<String> {
+        let staging = tempfile::tempdir().unwrap();
+        let mut da = PodmanArgs::new();
+        da.xdg_dirs(config_dir, edit_config, staging.path())
+            .unwrap();
+        da.into_vec()
     }
 
     #[test]
@@ -924,7 +1286,9 @@ mod tests {
         fs::create_dir_all(dir.join("plugins")).unwrap();
         fs::create_dir_all(dir.join("node_modules")).unwrap();
 
-        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+        let mounts = &plan.mounts;
         for name in [
             "opencode.jsonc",
             "AGENTS.md",
@@ -934,14 +1298,18 @@ mod tests {
             "node_modules",
         ] {
             assert!(
-                has_mount(&mounts, name),
+                has_mount(mounts, name),
                 "missing read-only mount for {name}: {mounts:?}"
             );
         }
         for name in ["cli.json", "service.json", "tui.json"] {
             assert!(
-                !has_mount(&mounts, name),
-                "runtime file {name} should stay writable: {mounts:?}"
+                !has_mount(mounts, name) && !has_rw_mount(mounts, name),
+                "runtime file {name} should be staged, not mounted: {mounts:?}"
+            );
+            assert!(
+                staging.path().join(name).is_file(),
+                "runtime file {name} should be a staged copy: {mounts:?}"
             );
         }
     }
@@ -957,7 +1325,7 @@ mod tests {
         fs::write(store.join("cli.json"), "{}").unwrap();
         symlink(store.join("cli.json"), dir.join("cli.json")).unwrap();
 
-        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        let mounts = plan_mounts(&dir, false);
         assert!(
             has_mount(&mounts, "cli.json"),
             "symlinked cli.json must be mounted read-only: {mounts:?}"
@@ -971,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn config_mounts_edit_config_mounts_only_symlinks() {
+    fn config_mounts_edit_config_mounts_symlinks_ro_and_dirs_rw() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("opencode");
         let store = tmp.path().join("store");
@@ -983,15 +1351,30 @@ mod tests {
         fs::write(store.join("AGENTS.md"), "rules").unwrap();
         symlink(store.join("AGENTS.md"), dir.join("AGENTS.md")).unwrap();
 
-        let mounts = opencode_config_mounts(&dir, true).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, true, staging.path()).unwrap();
+        let mounts = &plan.mounts;
         assert!(
-            has_mount(&mounts, "AGENTS.md"),
+            has_mount(mounts, "AGENTS.md"),
             "Nix-managed symlink must stay read-only with --edit-config: {mounts:?}"
         );
-        for name in ["opencode.jsonc", "cli.json", "assets"] {
+        let agents_staged = fs::symlink_metadata(staging.path().join("AGENTS.md")).unwrap();
+        assert!(
+            agents_staged.is_file() && !agents_staged.file_type().is_symlink(),
+            "symlinked entry needs a real staged destination: {mounts:?}"
+        );
+        assert!(
+            has_rw_mount(mounts, "assets"),
+            "a regular directory should be writable with --edit-config: {mounts:?}"
+        );
+        for name in ["opencode.jsonc", "cli.json"] {
             assert!(
-                !has_mount(&mounts, name),
-                "regular {name} should stay writable with --edit-config: {mounts:?}"
+                !has_mount(mounts, name) && !has_rw_mount(mounts, name),
+                "regular file {name} should be staged, not mounted: {mounts:?}"
+            );
+            assert!(
+                staging.path().join(name).is_file(),
+                "regular file {name} should be a staged copy: {mounts:?}"
             );
         }
     }
@@ -1007,7 +1390,7 @@ mod tests {
         fs::write(store.join("cli.json"), "{}").unwrap();
         symlink(store.join("cli.json"), dir.join("cli.json")).unwrap();
 
-        let mounts = opencode_config_mounts(&dir, true).unwrap();
+        let mounts = plan_mounts(&dir, true);
         assert!(
             has_mount(&mounts, "cli.json"),
             "symlinked cli.json must stay read-only with --edit-config: {mounts:?}"
@@ -1019,6 +1402,227 @@ mod tests {
     }
 
     #[test]
+    fn config_mounts_symlinked_entry_uses_real_destination() {
+        // This is the regression that made Nix/Home Manager configs fail:
+        // the mount destination must be a real file/dir in the staging tree,
+        // never the host symlink (whose store target is absent in-container).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(store.join("assets")).unwrap();
+        fs::write(store.join("assets/church-bell.mp3"), "x").unwrap();
+        fs::write(store.join("opencode.jsonc"), "{}").unwrap();
+        symlink(store.join("assets"), dir.join("assets")).unwrap();
+        symlink(store.join("opencode.jsonc"), dir.join("opencode.jsonc")).unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+
+        let assets = fs::symlink_metadata(staging.path().join("assets")).unwrap();
+        assert!(
+            assets.is_dir() && !assets.file_type().is_symlink(),
+            "assets needs a real staged dir"
+        );
+        let config = fs::symlink_metadata(staging.path().join("opencode.jsonc")).unwrap();
+        assert!(
+            config.is_file() && !config.file_type().is_symlink(),
+            "opencode.jsonc needs a real staged file"
+        );
+        assert!(has_mount(&plan.mounts, "assets"));
+        assert!(has_mount(&plan.mounts, "opencode.jsonc"));
+        assert!(
+            plan.mounts
+                .iter()
+                .all(|m| m.starts_with(&store.display().to_string())),
+            "mounts should use the resolved store sources: {:?}",
+            plan.mounts
+        );
+    }
+
+    #[test]
+    fn config_mounts_edit_config_stages_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{\"model\":\"x\"}").unwrap();
+        fs::write(dir.join("package.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("plugins")).unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, true, staging.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(staging.path().join("opencode.jsonc")).unwrap(),
+            "{\"model\":\"x\"}"
+        );
+        assert!(staging.path().join("plugins").is_dir());
+        assert!(has_rw_mount(&plan.mounts, "plugins"));
+        assert!(!has_rw_mount(&plan.mounts, "opencode.jsonc"));
+        assert!(!has_mount(&plan.mounts, "opencode.jsonc"));
+        assert_eq!(plan.writable.len(), 2);
+    }
+
+    #[test]
+    fn sync_config_writes_back_edited_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cli.json"), "{\"a\":1}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+        fs::write(staging.path().join("cli.json"), "{\"a\":2}").unwrap();
+        sync_config(&plan, &dir, false, staging.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("cli.json")).unwrap(),
+            "{\"a\":2}"
+        );
+    }
+
+    #[test]
+    fn sync_config_keeps_host_version_on_concurrent_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cli.json"), "{\"a\":1}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+        fs::write(dir.join("cli.json"), "{\"host\":true}").unwrap();
+        fs::write(staging.path().join("cli.json"), "{\"sandbox\":true}").unwrap();
+        sync_config(&plan, &dir, false, staging.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("cli.json")).unwrap(),
+            "{\"host\":true}"
+        );
+    }
+
+    #[test]
+    fn sync_config_copies_new_runtime_file_in_locked_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+        fs::write(staging.path().join("service.json"), "{\"password\":\"x\"}").unwrap();
+        sync_config(&plan, &dir, false, staging.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("service.json")).unwrap(),
+            "{\"password\":\"x\"}"
+        );
+    }
+
+    #[test]
+    fn sync_config_discards_new_non_runtime_file_in_locked_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+        fs::write(staging.path().join("opencode.json"), "{}").unwrap();
+        sync_config(&plan, &dir, false, staging.path()).unwrap();
+        assert!(!dir.join("opencode.json").exists());
+    }
+
+    #[test]
+    fn sync_config_copies_new_entries_in_edit_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, true, staging.path()).unwrap();
+        fs::write(staging.path().join("opencode.json"), "{\"model\":\"y\"}").unwrap();
+        fs::create_dir_all(staging.path().join("agent")).unwrap();
+        fs::write(staging.path().join("agent/review.md"), "rules").unwrap();
+        sync_config(&plan, &dir, true, staging.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("opencode.json")).unwrap(),
+            "{\"model\":\"y\"}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("agent/review.md")).unwrap(),
+            "rules"
+        );
+    }
+
+    #[test]
+    fn sync_config_skips_new_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, true, staging.path()).unwrap();
+        symlink("/etc/passwd", staging.path().join("passwd")).unwrap();
+        sync_config(&plan, &dir, true, staging.path()).unwrap();
+        assert!(
+            !dir.join("passwd").exists(),
+            "new symlinks must not be copied back"
+        );
+    }
+
+    #[test]
+    fn sync_config_does_not_overwrite_new_host_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, true, staging.path()).unwrap();
+        fs::write(staging.path().join("AGENTS.md"), "sandbox").unwrap();
+        fs::write(dir.join("AGENTS.md"), "host").unwrap();
+        sync_config(&plan, &dir, true, staging.path()).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("AGENTS.md")).unwrap(), "host");
+    }
+
+    #[test]
+    fn sync_config_leaves_host_file_when_staged_copy_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cli.json"), "{\"a\":1}").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+        fs::remove_file(staging.path().join("cli.json")).unwrap();
+        sync_config(&plan, &dir, false, staging.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("cli.json")).unwrap(),
+            "{\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn sync_config_does_not_follow_host_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("opencode");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cli.json"), "{\"a\":1}").unwrap();
+        let target = tmp.path().join("target");
+        fs::write(&target, "secret").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let plan = opencode_config_mounts(&dir, false, staging.path()).unwrap();
+        fs::remove_file(dir.join("cli.json")).unwrap();
+        symlink(&target, dir.join("cli.json")).unwrap();
+        fs::write(staging.path().join("cli.json"), "{\"a\":2}").unwrap();
+        sync_config(&plan, &dir, false, staging.path()).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "secret");
+        assert!(fs::symlink_metadata(dir.join("cli.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
     fn config_mounts_skip_broken_symlinks() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("opencode");
@@ -1026,7 +1630,7 @@ mod tests {
         fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
         symlink(dir.join("missing"), dir.join("AGENTS.md")).unwrap();
 
-        let mounts = opencode_config_mounts(&dir, false).unwrap();
+        let mounts = plan_mounts(&dir, false);
         assert!(
             !has_mount(&mounts, "AGENTS.md"),
             "broken symlinks must be skipped: {mounts:?}"

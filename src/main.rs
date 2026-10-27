@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 mod config;
 mod path;
@@ -48,7 +50,7 @@ struct Cli {
         num_args = 0..=1,
         require_equals = true,
         default_missing_value = "true",
-        help = "Make regular config files and the plugins dir writable so config and plugins can be edited inside the container (default: every config entry is read-only except the runtime-writable cli.json, service.json and tui.json). Nix-managed symlinks stay read-only even with --edit-config. Use --edit-config=false to force locked mode even when a profile enables it"
+        help = "Make existing regular config entries writable and copy new top-level config entries back to the host when the sandbox exits. Regular directories are writable immediately; symlinked entries stay read-only. In locked mode every entry is read-only except the runtime files cli.json, service.json and tui.json, and new top-level entries are per-run. Use --edit-config=false to force locked mode even when a profile enables it"
     )]
     edit_config: Option<bool>,
 
@@ -110,7 +112,7 @@ fn main() -> Result<()> {
             .map(|n| format!(" (via profile '{n}')"))
             .unwrap_or_default();
         eprintln!(
-            "\x1b[33mWarning: edit_config is enabled{via}: regular opencode config files and the plugins dir are writable in-container this run; agent writes persist to the host and all future runs. Nix-managed symlinks stay read-only.\x1b[0m"
+            "\x1b[33mWarning: edit_config is enabled{via}: existing regular config entries and the plugins dir are writable in-container this run, and new top-level entries are copied back to the host when the sandbox exits. Symlinked entries stay read-only.\x1b[0m"
         );
     }
 
@@ -141,10 +143,25 @@ fn resolve_image(cfg: &config::ResolvedConfig) -> Result<String> {
 fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String]) -> Result<()> {
     let subcommand = extra_args.first().map(String::as_str);
     let config_dir = dirs::config_dir().context("config dir required")?;
+    let config_root = config_dir.join("opencode");
+
+    // Per-run staging for the container's opencode config dir. Real
+    // placeholders/copies in here keep every mount destination a real file or
+    // directory, which is what lets symlinked (Nix/Home Manager) config entries
+    // work; the host config dir is never bind-mounted read-write. The mode let
+    // the OCI runtime traverse the tree while the container user (the same
+    // uid) owns it.
+    let staging = tempfile::Builder::new()
+        .prefix("opencode-sandbox-config-")
+        .tempdir()
+        .context("failed to create config staging dir")?;
+    fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o711))
+        .context("failed to set config staging dir permissions")?;
+
     let mut da = podman::PodmanArgs::new();
-    da.base(util::is_rootless())
-        .xdg_dirs(&config_dir, cfg.edit_config)?
-        .workspace()?
+    da.base(util::is_rootless());
+    let config_plan = da.xdg_dirs(&config_dir, cfg.edit_config, staging.path())?;
+    da.workspace()?
         .security(util::selinux_enforcing())
         .network()
         .git_config()?;
@@ -186,7 +203,14 @@ fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String
         .status()
         .context("failed to execute podman")?;
 
-    std::process::exit(status.code().unwrap_or(1));
+    let code = status.code().unwrap_or(1);
+    if let Err(err) =
+        podman::sync_config(&config_plan, &config_root, cfg.edit_config, staging.path())
+    {
+        eprintln!("Warning: failed to sync config changes back to the host: {err:#}");
+    }
+    let _ = staging.close();
+    std::process::exit(code);
 }
 
 /// Build the `opencode` argument vector for a run.

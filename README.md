@@ -126,7 +126,7 @@ variants = [[], ["R"], ["Rust"], ["R", "Rust"]]
 [profile.myenv]
 env = { FOO = "bar" }
 ports = [8080]
-# edit_config = true   # mount the config dir read-write (see Permissions)
+# edit_config = true   # make config editable in-container; syncs back on exit (see Permissions)
 ```
 
 Image names are canonical: features are deduplicated, sorted (R before Rust), and lowercased, so
@@ -201,7 +201,7 @@ Runs use the OpenCode V2 release, auto-tracked by `--build` (fallback default `2
   a backup of that database before switching if you want a rollback path (V2 is beta and data may be reset).
 - Existing `opencode.json(c)` config and `.opencode/` definitions keep working (V2 reads them in-memory).
   Terminal settings are auto-migrated from `tui.json` to `cli.json` on first startup, which is why the
-  `~/.config/opencode` mount is now read-write.
+  runtime needs a writable config dir; it gets a per-run staging tree (see Permissions).
 - The `~/.local/share/opentui` mount is kept: V2's TUI renders through opentui, which resolves its data path
   to `$XDG_DATA_HOME/opentui` (`/opencode/data/opentui`). Its Tree-sitter highlight worker caches parsers and
   queries there. Removing the mount makes the worker fail silently and markdown/code highlighting degrade to
@@ -247,41 +247,56 @@ What the default policy does:
   `agent.plan` model/variant/temperature settings. The plan directory itself
   (`~/.local/share/opencode-sandbox/home/.opencode/plan`) is created host-side with the rest of the home, so
   it is writable from the first run.
-- **Agents can never modify their own setup.** Every config entry is bind-mounted **read-only** into the
-  container, except the runtime-writable regular files `cli.json`, `service.json` and `tui.json`. Symlinked
-  entries are mounted read-only even in `--edit-config` runs: they point into the Nix store, where writes
-  fail anyway, and keeping the mount means a Nix-managed config stays visible instead of dangling. So even a
-  compromised agent cannot rewrite its permissions. Hard `deny` `policies` additionally block tool
-  reads/edits of the credential files, the recorded shell/tool-output archives, `service.json` and the
-  session database regardless of any approval. Policies cannot be overridden by project configs or "allow
-  always" approvals.
+- **Agents cannot persist new config.** Each run assembles the container's config dir in a per-run staging
+  tree rather than bind-mounting the host config dir: every existing entry gets a **real** file or directory
+  as its mount target, read-only entries are mounted read-only, writable regular files are staged copies,
+  and writable directories exist only with `--edit-config`. Symlinked entries (Nix/Home Manager) are resolved
+  and mounted read-only, so they stay visible instead of dangling — the container never sees a symlink as a
+  mount destination. New top-level config files created in a locked run are discarded when the sandbox exits;
+  only the runtime files `cli.json`, `service.json` and `tui.json` are copied back. That closes the
+  "write a new `opencode.json`/agent/plugin into the rw parent" self-escalation path. Hard `deny` `policies`
+  additionally block tool reads/edits of the credential files, the recorded shell/tool-output archives,
+  `service.json` and the session database regardless of any approval. Policies cannot be overridden by
+  project configs or "allow always" approvals.
 - **Shell runs without prompting** (V2's allow-by-default base policy keeps the agent productive); only
   `git push` is always denied.
 
-Edit permissions on the **host** (the global config files in `~/.config/opencode/`) — because they are
-mounted read-only, in-container commands that write global config (`opencode config set --global`,
-`opencode mcp add --global`) fail with a read-only filesystem error by design. Regular `cli.json`,
-`service.json` and `tui.json` stay writable (TUI settings, serve password); a symlinked one is read-only like
-the rest. Plugin management is host-side too: `opencode plugin add` writes the global config, and the plugin
-surfaces — the discovery directory (`~/.config/opencode/plugins/`), `node_modules` and the package manifests —
-are mounted read-only, so a writable plugin target never exists for an agent to persist code that runs on
-every launch.
+The host config dir (`~/.config/opencode/`) is never bind-mounted read-write. In a locked run every existing
+entry is read-only except the runtime-writable regular files `cli.json`, `service.json` and `tui.json` (staged
+copies, written back on exit); a symlinked one is read-only like the rest. In-container commands that write
+global config (`opencode config set --global`, `opencode mcp add --global`) therefore fail with a read-only
+filesystem error by design, and plugin management is host-side: the plugin surfaces — the discovery directory
+(`~/.config/opencode/plugins/`), `node_modules` and the package manifests — are mounted read-only, so a
+writable plugin target never exists for an agent to persist code that runs on every launch.
 
 Prefer editing from inside the container? Run with `--edit-config` (or set `edit_config = true` in a
-profile): it makes regular config files and the plugins dir writable for that run, so
-`opencode config set --global`, `opencode plugin add` and direct file edits work in-container and persist to
-the host config dir. Nix-managed symlinks stay read-only (they could not be written anyway). Use it
-deliberately — in an `--edit-config` session an agent could also write regular config files via shell — and
-note that a profile turning it on prints a warning at launch; `--edit-config=false` forces locked mode back
-on even for such a profile.
+profile). It makes every existing regular config file a writable **staged copy** and every existing regular
+directory (the plugins dir, `node_modules`, `assets`, `agent`, ...) a writable bind mount. Symlinked entries
+stay read-only (they point into the Nix store). Changes to regular files and new top-level files/dirs are
+copied back to the host config dir when the sandbox exits; changes inside the writable directories are
+immediate. `opencode config set --global`, `opencode plugin add`, `opencode mcp add --global` and direct file
+edits therefore work in-container and persist. Deletions and renames of existing entries are not propagated
+— edit the host directly for structural changes. Because the sync happens at exit, a forcibly killed CLI can
+lose unsynced file edits (directory changes are already on the host). Use it deliberately — in an
+`--edit-config` session an agent could also write regular config files via shell — and note that a profile
+turning it on prints a warning at launch; `--edit-config=false` forces locked mode back on even for such a
+profile.
 
 ### Known limitations
 
 - Permission rules govern the agent's *tools*; a shell command still has the container user's full filesystem
   authority. Anything an agent can `sh` can read (credentials, session data, the serve password) and — except
-  for the read-only mounts — write. The hardened mounts exist to prevent *self-escalation* (rewriting
-  permissions) and silent plugin persistence, not to sandbox hostile code: **the container is the trust
-  boundary**.
+  for the read-only mounts — write. The host config dir itself is not mounted; in-container writes to it land
+  in the per-run staging tree (plus the staged runtime files, which are synced back). The hardened mounts
+  exist to prevent *self-escalation* (rewriting permissions) and silent plugin persistence, not to sandbox
+  hostile code: **the container is the trust boundary**.
+- **The config dir is assembled per run.** Writable regular files are staged copies (`cli.json`,
+  `service.json` and `tui.json` in locked mode; every regular file with `--edit-config`) and are written back
+  when the sandbox exits normally — a SIGKILL loses unsynced file edits. Changes inside existing writable
+  directories are immediate. In locked mode, new top-level config files are per-run, and a newly created
+  runtime file is copied back. Deletions and renames of existing entries are not propagated. Host changes to
+  the config dir during a run are not visible to that run, and a host edit that races the copy-back wins, with
+  a warning. Symlinked config entries are always read-only.
 - Project-level plugins (`.opencode/plugins/` in a repository the agent writes) cannot be blocked without also
   blocking workspace writes. The global `plugins` control list (`-` prefixes, e.g. `"-*"`) is the only lever
   against them, and a repository can re-enable plugins it declares itself, so treat project plugin runs as
@@ -345,7 +360,7 @@ Notes:
 opencode-sandbox                          # run in the current directory
 opencode-sandbox -p myenv                 # use a profile
 opencode-sandbox --feature Rust           # enable Rust toolchain for this run
-opencode-sandbox --edit-config            # make regular config files/plugins writable for in-container edits
+opencode-sandbox --edit-config            # edit existing config in-container; sync back on exit
 opencode-sandbox -P 8080 serve            # run `serve` (headless API + web), passing remaining args to opencode
 ```
 
