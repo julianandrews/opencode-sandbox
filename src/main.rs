@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 mod config;
 mod path;
@@ -129,15 +131,33 @@ fn main() -> Result<()> {
 
 fn resolve_image(cfg: &config::ResolvedConfig) -> Result<String> {
     let image = config::image_name_for(&cfg.features);
+    let base_image = base_image_for_run(cfg);
     if config::variants_contain(&cfg.build, &cfg.default_features, &cfg.features) {
-        ensure_image(&image, &cfg.features, &cfg.build.base_image())?;
+        ensure_image(&image, &cfg.features, &base_image)?;
     } else {
         eprintln!(
             "Feature set {image} is not in the [build] variants; rebuilding on every run (add it there to make runs instant)."
         );
-        build_variant(&cfg.features, &image, &cfg.build.base_image(), true)?;
+        build_variant(&cfg.features, &image, &base_image, true)?;
     }
     Ok(image)
+}
+
+/// The base image for run-time builds. An explicit `[build] base_image` pin
+/// wins; otherwise reuse the base recorded by the last successful `--build`.
+/// This keeps unlisted feature sets on the same release as the variant images
+/// without making every run query the registry.
+fn base_image_for_run(cfg: &config::ResolvedConfig) -> String {
+    select_run_base_image(
+        cfg.build.base_image.as_deref(),
+        recorded_base_image().as_deref(),
+    )
+}
+
+fn select_run_base_image(pin: Option<&str>, recorded: Option<&str>) -> String {
+    pin.or(recorded)
+        .unwrap_or(config::DEFAULT_BASE_IMAGE)
+        .to_string()
 }
 
 fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String]) -> Result<()> {
@@ -299,7 +319,14 @@ fn cmd_build(cli: &Cli) -> Result<()> {
         vec![cli.feature.clone()]
     };
 
-    let base_image = build_base_image(&cfg);
+    let selection = build_base_image(&cfg);
+    let base_image = selection.image;
+    let discovered = selection.discovered;
+    if !discovered {
+        println!(
+            "Registry lookup did not produce a newest release; existing variant images will be kept and {base_image} will be used for missing ones."
+        );
+    }
 
     let mut seen = std::collections::HashSet::new();
     for features in &variants {
@@ -316,54 +343,143 @@ fn cmd_build(cli: &Cli) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join("+")
         };
+        if !discovered && image_exists(&name)? {
+            println!("Skipping {name} ({label}); keeping the existing image.");
+            continue;
+        }
         println!("Building {name} ({label})");
         build_variant(features, &name, &base_image, true)?;
+    }
+    if discovered {
+        record_base_image(&base_image);
     }
     prune_images()?;
     Ok(())
 }
 
+/// A resolved base image plus whether it came from a successful pin or
+/// registry lookup. A fallback result is not trusted to update or replace
+/// existing images.
+#[derive(Debug, PartialEq, Eq)]
+struct BaseImageSelection {
+    image: String,
+    discovered: bool,
+}
+
 /// The base image for a `--build` run: the configured pin, or the newest
-/// OpenCode V2 release tag from the registry, falling back to the default
-/// when the registry can't be reached (the daily timer must not hard-fail).
-fn build_base_image(cfg: &config::Config) -> String {
-    build_base_image_with(cfg, registry::latest_base_image)
+/// OpenCode V2 release tag from the registry. When discovery fails, reuse the
+/// last base recorded by a successful build (or the compiled-in default) and
+/// mark the result untrusted so existing variants are left alone.
+fn build_base_image(cfg: &config::Config) -> BaseImageSelection {
+    let recorded = recorded_base_image();
+    build_base_image_with(cfg, registry::latest_base_image, recorded.as_deref())
 }
 
 fn build_base_image_with(
     cfg: &config::Config,
     discover: impl Fn() -> Result<registry::Latest>,
-) -> String {
+    recorded: Option<&str>,
+) -> BaseImageSelection {
     if let Some(pin) = &cfg.build.base_image {
         println!("Using pinned base image {pin}");
-        return pin.clone();
+        return BaseImageSelection {
+            image: pin.clone(),
+            discovered: true,
+        };
     }
+
+    let fallback = || recorded.unwrap_or(config::DEFAULT_BASE_IMAGE).to_string();
     match discover() {
-        Ok(latest) => {
-            if let Some(image) = latest.image {
-                println!("Newest OpenCode V2 release: {image}");
-                image
-            } else {
-                let reason = if latest.truncated {
-                    "registry tag list was cut off before it ended"
-                } else {
-                    "registry has no 2.x release tags"
-                };
-                eprintln!(
-                    "Warning: {reason}; using default {}. Pin one with [build] base_image.",
-                    config::DEFAULT_BASE_IMAGE
-                );
-                config::DEFAULT_BASE_IMAGE.to_string()
+        Ok(latest) if latest.truncated => {
+            let image = fallback();
+            eprintln!(
+                "Warning: registry tag list was cut off before it ended; using {image} instead of the partial result. Pin one with [build] base_image."
+            );
+            BaseImageSelection {
+                image,
+                discovered: false,
             }
         }
+        Ok(latest) => match latest.image {
+            Some(image) => {
+                println!("Newest OpenCode V2 release: {image}");
+                BaseImageSelection {
+                    image,
+                    discovered: true,
+                }
+            }
+            None => {
+                let image = fallback();
+                eprintln!(
+                    "Warning: registry has no 2.x release tags; using {image}. Pin one with [build] base_image."
+                );
+                BaseImageSelection {
+                    image,
+                    discovered: false,
+                }
+            }
+        },
         Err(err) => {
+            let image = fallback();
             eprintln!(
-                "Warning: could not check the registry for the newest OpenCode V2 release ({err:#}); using default {}. Pin one with [build] base_image.",
-                config::DEFAULT_BASE_IMAGE
+                "Warning: could not check the registry for the newest OpenCode V2 release ({err:#}); using {image}. Pin one with [build] base_image."
             );
-            config::DEFAULT_BASE_IMAGE.to_string()
+            BaseImageSelection {
+                image,
+                discovered: false,
+            }
         }
     }
+}
+
+fn base_image_state_path_for(data_dir: &Path) -> PathBuf {
+    data_dir.join("opencode-sandbox/base-image")
+}
+
+fn base_image_state_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|data_dir| base_image_state_path_for(&data_dir))
+}
+
+fn recorded_base_image() -> Option<String> {
+    base_image_state_path().and_then(|path| read_base_image(&path))
+}
+
+fn read_base_image(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn record_base_image(image: &str) {
+    let Some(path) = base_image_state_path() else {
+        eprintln!(
+            "Warning: could not determine the data directory; not recording base image {image}."
+        );
+        return;
+    };
+    if let Err(err) = write_base_image(&path, image) {
+        eprintln!(
+            "Warning: could not record base image {image} at '{}': {err:#}",
+            path.display()
+        );
+    }
+}
+
+fn write_base_image(path: &Path, image: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("base image state path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create a temp file in '{}'", parent.display()))?;
+    writeln!(tmp, "{image}")
+        .with_context(|| format!("failed to write base image state '{}'", path.display()))?;
+    tmp.persist(path)
+        .map(|_| ())
+        .map_err(|err| err.error)
+        .with_context(|| format!("failed to move base image state into '{}'", path.display()))
 }
 
 fn prune_images() -> Result<()> {
@@ -987,57 +1103,115 @@ base_image = "ghcr.io/anomalyco/opencode:2.0.18"
         )
         .unwrap();
         let discovered = std::cell::Cell::new(false);
-        let image = build_base_image_with(&config, || {
-            discovered.set(true);
-            Ok(registry::Latest {
-                image: Some("ghcr.io/anomalyco/opencode:9.9.9".to_string()),
-                truncated: false,
-            })
-        });
-        assert_eq!(image, "ghcr.io/anomalyco/opencode:2.0.18");
+        let selection = build_base_image_with(
+            &config,
+            || {
+                discovered.set(true);
+                Ok(registry::Latest {
+                    image: Some("ghcr.io/anomalyco/opencode:9.9.9".to_string()),
+                    truncated: false,
+                })
+            },
+            None,
+        );
+        assert_eq!(selection.image, "ghcr.io/anomalyco/opencode:2.0.18");
+        assert!(selection.discovered);
         assert!(!discovered.get());
     }
 
     #[test]
     fn build_base_image_uses_discovered_when_unset() {
         let config: config::Config = toml::from_str("").unwrap();
-        let image = build_base_image_with(&config, || {
-            Ok(registry::Latest {
-                image: Some("ghcr.io/anomalyco/opencode:2.0.19".to_string()),
-                truncated: false,
-            })
-        });
-        assert_eq!(image, "ghcr.io/anomalyco/opencode:2.0.19");
+        let selection = build_base_image_with(
+            &config,
+            || {
+                Ok(registry::Latest {
+                    image: Some("ghcr.io/anomalyco/opencode:2.0.19".to_string()),
+                    truncated: false,
+                })
+            },
+            None,
+        );
+        assert_eq!(selection.image, "ghcr.io/anomalyco/opencode:2.0.19");
+        assert!(selection.discovered);
     }
 
     #[test]
     fn build_base_image_falls_back_when_registry_has_no_v2_tags() {
         let config: config::Config = toml::from_str("").unwrap();
-        let image = build_base_image_with(&config, || {
-            Ok(registry::Latest {
-                image: None,
-                truncated: false,
-            })
-        });
-        assert_eq!(image, config::DEFAULT_BASE_IMAGE);
+        let selection = build_base_image_with(
+            &config,
+            || {
+                Ok(registry::Latest {
+                    image: None,
+                    truncated: false,
+                })
+            },
+            None,
+        );
+        assert_eq!(selection.image, config::DEFAULT_BASE_IMAGE);
+        assert!(!selection.discovered);
     }
 
     #[test]
-    fn build_base_image_falls_back_when_tag_list_truncated() {
+    fn build_base_image_falls_back_when_tag_list_truncated_even_with_a_tag() {
+        // A truncated list can contain an older 2.x tag. That is not the
+        // newest release, so never use it as if it were.
         let config: config::Config = toml::from_str("").unwrap();
-        let image = build_base_image_with(&config, || {
-            Ok(registry::Latest {
-                image: None,
-                truncated: true,
-            })
-        });
-        assert_eq!(image, config::DEFAULT_BASE_IMAGE);
+        let selection = build_base_image_with(
+            &config,
+            || {
+                Ok(registry::Latest {
+                    image: Some("ghcr.io/anomalyco/opencode:2.0.19".to_string()),
+                    truncated: true,
+                })
+            },
+            Some("ghcr.io/anomalyco/opencode:2.2.0"),
+        );
+        assert_eq!(selection.image, "ghcr.io/anomalyco/opencode:2.2.0");
+        assert!(!selection.discovered);
     }
 
     #[test]
-    fn build_base_image_falls_back_when_registry_unreachable() {
+    fn build_base_image_uses_recorded_base_when_registry_unreachable() {
         let config: config::Config = toml::from_str("").unwrap();
-        let image = build_base_image_with(&config, || Err(anyhow!("registry unreachable")));
-        assert_eq!(image, config::DEFAULT_BASE_IMAGE);
+        let selection = build_base_image_with(
+            &config,
+            || Err(anyhow!("registry unreachable")),
+            Some("ghcr.io/anomalyco/opencode:2.2.0"),
+        );
+        assert_eq!(selection.image, "ghcr.io/anomalyco/opencode:2.2.0");
+        assert!(!selection.discovered);
+    }
+
+    #[test]
+    fn build_base_image_falls_back_to_default_without_recorded_base() {
+        let config: config::Config = toml::from_str("").unwrap();
+        let selection =
+            build_base_image_with(&config, || Err(anyhow!("registry unreachable")), None);
+        assert_eq!(selection.image, config::DEFAULT_BASE_IMAGE);
+        assert!(!selection.discovered);
+    }
+
+    #[test]
+    fn run_base_image_prefers_pin_then_recorded_then_default() {
+        assert_eq!(select_run_base_image(Some("pin"), Some("recorded")), "pin");
+        assert_eq!(select_run_base_image(None, Some("recorded")), "recorded");
+        assert_eq!(
+            select_run_base_image(None, None),
+            config::DEFAULT_BASE_IMAGE
+        );
+    }
+
+    #[test]
+    fn base_image_state_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = base_image_state_path_for(tmp.path());
+        assert_eq!(read_base_image(&path), None);
+        write_base_image(&path, "ghcr.io/anomalyco/opencode:2.2.0").unwrap();
+        assert_eq!(
+            read_base_image(&path).as_deref(),
+            Some("ghcr.io/anomalyco/opencode:2.2.0")
+        );
     }
 }

@@ -64,14 +64,6 @@ pub struct BuildConfig {
 /// Keep in sync with the Containerfile `ARG BASE_IMAGE` default.
 pub const DEFAULT_BASE_IMAGE: &str = "ghcr.io/anomalyco/opencode:2.0.19";
 
-impl BuildConfig {
-    pub fn base_image(&self) -> String {
-        self.base_image
-            .clone()
-            .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string())
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -294,9 +286,10 @@ variants = [["R"], ["Rust"], ["R", "Rust"]]
     }
 
     #[test]
-    fn base_image_defaults_to_v2() {
+    fn base_image_defaults_to_unset() {
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.build.base_image(), DEFAULT_BASE_IMAGE);
+        assert_eq!(config.build.base_image, None);
+        assert!(DEFAULT_BASE_IMAGE.starts_with("ghcr.io/anomalyco/opencode:2."));
     }
 
     #[test]
@@ -306,7 +299,10 @@ variants = [["R"], ["Rust"], ["R", "Rust"]]
 base_image = "ghcr.io/anomalyco/opencode:beta"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.build.base_image(), "ghcr.io/anomalyco/opencode:beta");
+        assert_eq!(
+            config.build.base_image.as_deref(),
+            Some("ghcr.io/anomalyco/opencode:beta")
+        );
     }
 
     #[test]
