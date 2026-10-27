@@ -26,11 +26,9 @@
   // plan mode's "no persistent project changes" guarantee intact. This is a
   // global rule rather than an `agents.plan.permissions` override: global
   // rules are evaluated after the agent's built-in defaults (last match wins),
-  // so it applies to the plan agent too. The legacy `agents` key must not be
-  // used here: when both `agent` and `agents` define the same agent, opencode
-  // lets the `agents` entry win, so a seeded `agents.plan` would silently
-  // discard a user's `agent.plan` model/variant/temperature (verified with
-  // `opencode debug agents`).
+  // so it applies to the plan agent too. The seed deliberately defines no
+  // agent entries: a seeded agent would override the user's own `agents`
+  // configuration, while the top-level rule already covers plan mode.
   "permissions": [
     { "action": "shell", "resource": "git push *", "effect": "deny" },
     { "action": "external_directory", "resource": "*", "effect": "allow" },

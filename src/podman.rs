@@ -1137,10 +1137,9 @@ mod tests {
         //
         // The `/tmp` edit rule is global, not an `agents.plan` override:
         // global rules are evaluated after the plan agent's built-in defaults,
-        // so they cover plan mode too. The legacy `agents` key must stay out
-        // of the seed -- when `agent` and `agents` define the same agent,
-        // opencode lets `agents` win, so seeding `agents.plan` would silently
-        // discard a user's `agent.plan` model/variant/temperature settings.
+        // so they cover plan mode too. The seed must not define agent entries:
+        // that would override the user's own `agents` configuration, including
+        // its `agents.plan` model settings.
         assert!(!content.contains("\"agents\""));
         for rule in [
             "{ \"action\": \"shell\", \"resource\": \"git push *\", \"effect\": \"deny\" }",

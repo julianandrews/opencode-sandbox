@@ -248,9 +248,9 @@ What the default policy does:
 - **Plan mode keeps its scratch.** The built-in `plan` agent denies all edits except opencode plan files. The
   seed adds a global `edit /tmp/* -> allow` rule (global rules run after the agent's built-in defaults, so it
   covers `plan` too), letting plan mode write tmpfs scratch without touching persistent state. The rule is
-  deliberately global rather than an `agents.plan.permissions` entry: when both `agent` and `agents` define
-  the same agent, opencode lets the `agents` entry win, so seeding one would silently discard your
-  `agent.plan` model/variant/temperature settings. The plan directory itself
+  deliberately global rather than an `agents.plan.permissions` entry: a global rule covers plan mode while
+  leaving the seed free of agent entries, so it does not override your own `agents` configuration (including
+  `agents.plan` model settings). The plan directory itself
   (`~/.local/share/opencode-sandbox/home/.opencode/plan`) is created host-side with the rest of the home, so
   it is writable from the first run.
 - **Agents cannot persist new config.** Each run assembles the container's config dir in a per-run staging
