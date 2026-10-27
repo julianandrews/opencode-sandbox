@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 
 mod config;
-mod docker;
 mod path;
+mod podman;
 mod r;
 mod r_setup;
 mod registry;
@@ -15,7 +15,7 @@ use config::Feature;
 #[command(
     name = "opencode-docker",
     version,
-    about = "Run opencode in a Docker container"
+    about = "Run opencode in a Podman container"
 )]
 struct Cli {
     #[arg(short = 'p', long = "profile")]
@@ -141,11 +141,11 @@ fn resolve_image(cfg: &config::ResolvedConfig) -> Result<String> {
 fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String]) -> Result<()> {
     let subcommand = extra_args.first().map(String::as_str);
     let config_dir = dirs::config_dir().context("config dir required")?;
-    let mut da = docker::DockerArgs::new();
-    da.base()
+    let mut da = podman::PodmanArgs::new();
+    da.base(util::is_rootless())
         .xdg_dirs(&config_dir, cfg.edit_config)?
         .workspace()?
-        .security()
+        .security(util::selinux_enforcing())
         .network()
         .git_config()?;
     // The TUI runs a private server over stdio in V2, so `-P` only maps a host
@@ -174,17 +174,17 @@ fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String
         da.cargo_home()?;
     }
 
-    let docker_args = da.into_vec();
+    let podman_args = da.into_vec();
 
     let opencode_args = opencode_command(cfg.ports.first().copied(), extra_args);
 
-    let status = std::process::Command::new("docker")
+    let status = podman::command()
         .arg("run")
-        .args(&docker_args)
+        .args(&podman_args)
         .arg(image)
         .args(&opencode_args)
         .status()
-        .context("failed to execute docker")?;
+        .context("failed to execute podman")?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -343,50 +343,38 @@ fn build_base_image_with(
 }
 
 fn prune_images() -> Result<()> {
-    let prune = std::process::Command::new("docker")
+    // Podman has no `builder prune --keep-storage`: Buildah's intermediate
+    // layers are ordinary dangling images, so `image prune -f` drops the
+    // unreferenced ones while keeping layers still used by the variant images.
+    let prune = podman::command()
         .args(["image", "prune", "-f"])
         .status()
-        .context("failed to run docker image prune")?;
+        .context("failed to run podman image prune")?;
     if !prune.success() {
-        anyhow::bail!("docker image prune failed (exit code: {:?})", prune.code());
-    }
-    let cache = std::process::Command::new("docker")
-        .args(["builder", "prune", "--keep-storage=10G"])
-        .status()
-        .context("failed to run docker builder prune")?;
-    if !cache.success() {
-        anyhow::bail!(
-            "docker builder prune failed (exit code: {:?})",
-            cache.code()
-        );
+        anyhow::bail!("podman image prune failed (exit code: {:?})", prune.code());
     }
     Ok(())
 }
 
 /// Check whether an image exists locally.
 ///
-/// Deliberately uses `docker image ls` (exit 0, empty output on a miss)
-/// rather than `docker image inspect`'s exit code: both "image not found" and
-/// infrastructure failures (daemon down, CLI error) exit non-zero, so an
-/// exit-code-only check would silently treat real errors as a missing image.
-/// Here a non-zero exit is a genuine error and is propagated, while exit 0
-/// with empty output definitively means "not found".
-///
-/// The positional reference matches the repository exactly but any tag of it;
-/// that is fine because every image is built with the implicit `:latest` tag.
+/// `podman image exists` returns 0 when the image is present, 1 when it is
+/// absent, and 125 when local storage cannot be accessed. That distinction is
+/// why this uses it instead of `image inspect`, whose exit code cannot
+/// separate "not found" from a real error.
 fn image_exists(name: &str) -> Result<bool> {
-    let output = std::process::Command::new("docker")
-        .args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", name])
+    let output = podman::command()
+        .args(["image", "exists", name])
         .output()
-        .context("failed to run docker image ls")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "docker image ls failed (exit code: {:?}): {}",
-            output.status.code(),
+        .context("failed to run podman image exists")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => anyhow::bail!(
+            "podman image exists failed (exit code: {code:?}): {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        );
+        ),
     }
-    Ok(!output.stdout.is_empty())
 }
 
 fn ensure_image(name: &str, features: &[Feature], base_image: &str) -> Result<()> {
@@ -415,9 +403,9 @@ const USER_ID_LABEL: &str = "org.opencode-docker.user-ids";
 
 /// The `USER_ID:USER_GID` baked into the image, read from its label. `None`
 /// when the image or label is absent (an image predating the label, or a
-/// non-docker error); the caller then rebuilds.
+/// non-Podman error); the caller then rebuilds.
 fn image_user_ids(name: &str) -> Result<Option<String>> {
-    let output = std::process::Command::new("docker")
+    let output = podman::command()
         .args([
             "image",
             "inspect",
@@ -426,7 +414,7 @@ fn image_user_ids(name: &str) -> Result<Option<String>> {
             name,
         ])
         .output()
-        .context("failed to run docker image inspect")?;
+        .context("failed to run podman image inspect")?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -448,10 +436,12 @@ fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) 
     let tmp = tempfile::tempdir()?;
     let df = tmp.path().join("Dockerfile");
     std::fs::write(&df, include_str!("../docker/Dockerfile"))?;
-    let mut cmd = std::process::Command::new("docker");
+    let mut cmd = podman::command();
     cmd.args(["build", "-t", tag]);
     if pull {
-        cmd.arg("--pull");
+        // Bare `--pull` is accepted by Podman and means `always`, but spell the
+        // policy out so the intent is obvious.
+        cmd.arg("--pull=always");
     }
     cmd.args(["--build-arg", &format!("BASE_IMAGE={base_image}")]);
     cmd.args(["--build-arg", &format!("USER_ID={}", util::uid())]);
@@ -465,9 +455,9 @@ fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) 
     }
     cmd.args(["--build-arg", &format!("INCLUDE_RUST={has_rust}")]);
     cmd.arg(tmp.path());
-    let status = cmd.status().context("failed to run docker build")?;
+    let status = cmd.status().context("failed to run podman build")?;
     if !status.success() {
-        anyhow::bail!("docker build failed (exit code: {:?})", status.code());
+        anyhow::bail!("podman build failed (exit code: {:?})", status.code());
     }
     Ok(())
 }

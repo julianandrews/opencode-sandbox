@@ -15,23 +15,57 @@ use crate::util;
 /// permissions, and the `deny` policies inside survive any project config.
 const DEFAULT_OPENCODE_CONFIG: &str = include_str!("../docker/opencode.jsonc.template");
 
+pub const PROGRAM: &str = "podman";
+
+/// The Podman command every subprocess path goes through.
+pub fn command() -> std::process::Command {
+    std::process::Command::new(PROGRAM)
+}
+
+/// Identity flags shared by the main run and the R dependency-setup container.
+///
+/// Rootless Podman maps the host user to a subuid by default, so a plain
+/// `--user <uid>:<gid>` makes bind-mount writes land as an unprivileged subuid
+/// (or fail outright). `--userns=keep-id` maps the host UID to the same UID
+/// inside the container, matching the passwd entry baked into the image by the
+/// `USER_ID` build arg.
+pub fn identity_args(rootless: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if rootless {
+        args.push("--userns=keep-id".into());
+    }
+    args.push("--user".into());
+    args.push(format!("{}:{}", util::uid(), util::gid()));
+    args
+}
+
+/// SELinux label separation blocks unlabelled bind mounts on enforcing hosts.
+/// Relabelling is not an option here: the config mounts include read-only
+/// Nix-store paths and the workspace may be large. Disable label separation
+/// for this rootless, read-only, no-capabilities container instead.
+pub fn selinux_args(enforcing: bool) -> Vec<String> {
+    if enforcing {
+        vec!["--security-opt=label=disable".into()]
+    } else {
+        Vec::new()
+    }
+}
+
 #[derive(Debug)]
-pub struct DockerArgs {
+pub struct PodmanArgs {
     args: Vec<String>,
 }
 
-impl DockerArgs {
+impl PodmanArgs {
     pub fn new() -> Self {
-        DockerArgs { args: Vec::new() }
+        PodmanArgs { args: Vec::new() }
     }
 
     pub fn into_vec(self) -> Vec<String> {
         self.args
     }
 
-    pub fn base(&mut self) -> &mut Self {
-        let uid = util::uid();
-        let gid = util::gid();
+    pub fn base(&mut self, rootless: bool) -> &mut Self {
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
         let lang = std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".to_string());
 
@@ -40,8 +74,7 @@ impl DockerArgs {
         self.args.push("--init".into());
         self.args.push("--hostname".into());
         self.args.push("opencode".into());
-        self.args.push("--user".into());
-        self.args.push(format!("{}:{}", uid, gid));
+        self.args.extend(identity_args(rootless));
         self.args.push("-e".into());
         self.args.push(format!("TERM={}", term));
         self.args.push("-e".into());
@@ -70,7 +103,7 @@ impl DockerArgs {
 
         let dirs_to_create = [
             // Created host-side so the bind mount is owned by the host user:
-            // Docker would otherwise create it as root and the container's
+            // Podman would otherwise create it as root and the container's
             // non-root user could not write cli.json/service.json (V2 mounts
             // the config dir read-write for its first-run tui.json migration).
             config.join("opencode"),
@@ -182,8 +215,9 @@ impl DockerArgs {
         Ok(self)
     }
 
-    pub fn security(&mut self) -> &mut Self {
+    pub fn security(&mut self, selinux_enforcing: bool) -> &mut Self {
         self.args.push("--security-opt=no-new-privileges".into());
+        self.args.extend(selinux_args(selinux_enforcing));
         self.args.push("--cap-drop".into());
         self.args.push("all".into());
         self.args.push("--read-only".into());
@@ -193,8 +227,11 @@ impl DockerArgs {
     }
 
     pub fn network(&mut self) -> &mut Self {
-        self.args.push("--add-host".into());
-        self.args.push("host.docker.internal:host-gateway".into());
+        // Podman adds host.containers.internal and host.docker.internal
+        // automatically. An explicit `--add-host ...:host-gateway` can make the
+        // run fail when Podman cannot determine a gateway address, so rely on
+        // the defaults. If host loopback is unreachable on a rootless host, add
+        // `--network=pasta:--map-gw` after verifying it on that host.
         self.args.push("-v".into());
         self.args.push("/etc/localtime:/etc/localtime:ro".into());
         self
@@ -348,7 +385,7 @@ const GLOBAL_CONFIG_FILES: &[&str] = &["opencode.jsonc", "opencode.json", "confi
 /// `--edit-config`: they point into the Nix store, so a writable mount could
 /// never work, and skipping the mount would expose a dangling symlink inside
 /// the container. Mounts are skipped for missing paths: mounting a nonexistent
-/// source would make Docker create a root-owned directory in the user's config
+/// source would make Podman create a root-owned directory in the user's config
 /// tree.
 fn opencode_config_mounts(config_dir: &Path, edit_config: bool) -> Result<Vec<String>> {
     let _ = seed_opencode_config(config_dir);
@@ -396,7 +433,7 @@ fn opencode_config_mounts(config_dir: &Path, edit_config: bool) -> Result<Vec<St
             continue;
         }
         // Resolve Nix-managed symlinks so the mount source is the store path
-        // itself rather than relying on Docker to follow the link.
+        // itself rather than relying on Podman to follow the link.
         let source = match path.canonicalize() {
             Ok(source) => source,
             Err(err) => {
@@ -501,13 +538,13 @@ mod tests {
 
     #[test]
     fn new_args_empty() {
-        let da = DockerArgs::new();
+        let da = PodmanArgs::new();
         assert!(da.into_vec().is_empty());
     }
 
     #[test]
     fn builder_ports_and_env_vars() {
-        let mut da = DockerArgs::new();
+        let mut da = PodmanArgs::new();
         da.ports(&[3000, 4000]);
         let mut vars = HashMap::new();
         vars.insert("KEY".to_string(), "val".to_string());
@@ -528,8 +565,8 @@ mod tests {
 
     #[test]
     fn builder_security_network() {
-        let mut da = DockerArgs::new();
-        da.security().network();
+        let mut da = PodmanArgs::new();
+        da.security(false).network();
         let args = da.into_vec();
         assert!(args.contains(&"--security-opt=no-new-privileges".to_string()));
         assert!(args.contains(&"--cap-drop".to_string()));
@@ -537,8 +574,51 @@ mod tests {
         assert!(args.contains(&"--read-only".to_string()));
         assert!(args.contains(&"--tmpfs".to_string()));
         assert!(args.contains(&"/tmp:exec".to_string()));
-        assert!(args.contains(&"host.docker.internal:host-gateway".to_string()));
+        assert!(!args.contains(&"host.docker.internal:host-gateway".to_string()));
         assert!(args.contains(&"/etc/localtime:/etc/localtime:ro".to_string()));
+    }
+
+    #[test]
+    fn identity_args_keep_id_only_for_rootless() {
+        let user = format!("{}:{}", util::uid(), util::gid());
+        assert_eq!(
+            identity_args(true),
+            vec![
+                "--userns=keep-id".to_string(),
+                "--user".to_string(),
+                user.clone()
+            ]
+        );
+        assert_eq!(identity_args(false), vec!["--user".to_string(), user]);
+    }
+
+    #[test]
+    fn security_adds_selinux_label_disable_only_when_enforcing() {
+        let mut locked = PodmanArgs::new();
+        locked.security(false);
+        assert!(!locked
+            .into_vec()
+            .contains(&"--security-opt=label=disable".to_string()));
+
+        let mut selinux = PodmanArgs::new();
+        selinux.security(true);
+        assert!(selinux
+            .into_vec()
+            .contains(&"--security-opt=label=disable".to_string()));
+    }
+
+    #[test]
+    fn base_uses_keep_id_when_rootless() {
+        let user = format!("{}:{}", util::uid(), util::gid());
+        let mut rootless = PodmanArgs::new();
+        rootless.base(true);
+        let args = rootless.into_vec();
+        assert!(args.contains(&"--userns=keep-id".to_string()));
+        assert!(args.windows(2).any(|w| w[0] == "--user" && w[1] == user));
+
+        let mut rootful = PodmanArgs::new();
+        rootful.base(false);
+        assert!(!rootful.into_vec().contains(&"--userns=keep-id".to_string()));
     }
 
     #[test]
@@ -547,7 +627,7 @@ mod tests {
         // be mounted writable (the rootfs is read-only) and HOME pointed at it,
         // or ssh-keygen's default ~/.ssh write fails after the passwd fix.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = DockerArgs::new();
+        let mut da = PodmanArgs::new();
         da.xdg_dirs(tmp.path(), false).unwrap();
         let args = da.into_vec();
         assert!(
@@ -567,7 +647,7 @@ mod tests {
         // without this writable mount the worker fails silently and markdown/code
         // highlighting degrades to raw text for non-root runs.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = DockerArgs::new();
+        let mut da = PodmanArgs::new();
         da.xdg_dirs(tmp.path(), false).unwrap();
         let args = da.into_vec();
         assert!(
@@ -582,7 +662,7 @@ mod tests {
         // npm plugin surface (node_modules + manifests) is installed there, so
         // both must be read-only for agents in locked mode.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = DockerArgs::new();
+        let mut da = PodmanArgs::new();
         da.xdg_dirs(tmp.path(), false).unwrap();
         let args = da.into_vec();
         assert!(
@@ -611,7 +691,7 @@ mod tests {
         // container. Nix-managed symlinks are covered by the unit tests; they
         // stay read-only even in this mode.
         let tmp = tempfile::tempdir().unwrap();
-        let mut da = DockerArgs::new();
+        let mut da = PodmanArgs::new();
         da.xdg_dirs(tmp.path(), true).unwrap();
         let args = da.into_vec();
         for forbidden in [
@@ -631,8 +711,8 @@ mod tests {
 
     #[test]
     fn builder_chaining() {
-        let mut da = DockerArgs::new();
-        da.ports(&[8080]).security().network();
+        let mut da = PodmanArgs::new();
+        da.ports(&[8080]).security(false).network();
         let args = da.into_vec();
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"127.0.0.1:8080:8080".to_string()));
@@ -647,7 +727,7 @@ mod tests {
             sub.to_string_lossy().to_string(),
             tmp.path().join("subdir").to_string_lossy().to_string(),
         ];
-        let mut da = DockerArgs::new();
+        let mut da = PodmanArgs::new();
         let result = da.extra_mounts(&mounts);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("duplicate"));
@@ -656,7 +736,7 @@ mod tests {
     #[test]
     fn extra_mounts_rejects_nonexistent() {
         let mounts = vec!["/nonexistent_opencode_test_xyz".to_string()];
-        let mut da = DockerArgs::new();
+        let mut da = PodmanArgs::new();
         let result = da.extra_mounts(&mounts);
         assert!(result.is_err());
     }

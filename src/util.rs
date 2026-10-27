@@ -10,6 +10,22 @@ pub fn gid() -> String {
     unsafe { libc::getgid() }.to_string()
 }
 
+/// True when the process is not running as root. For a local Podman this is
+/// the rootless/rootful split that decides whether `--userns=keep-id` is
+/// needed. Remote Podman (`CONTAINER_HOST`) is not supported.
+pub fn is_rootless() -> bool {
+    // SAFETY: geteuid is a simple syscall with no safety requirements.
+    (unsafe { libc::geteuid() }) != 0
+}
+
+/// SELinux is enforcing when `/sys/fs/selinux/enforce` is exactly "1".
+/// Non-SELinux hosts (and containers without the selinuxfs mount) are false.
+pub fn selinux_enforcing() -> bool {
+    std::fs::read_to_string("/sys/fs/selinux/enforce")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

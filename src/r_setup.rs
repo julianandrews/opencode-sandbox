@@ -3,6 +3,7 @@ use std::fs;
 
 use anyhow::{Context, Result};
 
+use crate::podman;
 use crate::r;
 use crate::util;
 
@@ -33,8 +34,6 @@ pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Res
     let r_lib_cache = home.join(".local/share/opencode-docker/r-library");
     fs::create_dir_all(&r_lib_cache)?;
 
-    let uid = util::uid();
-    let gid = util::gid();
     let cwd_basename = cwd
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -44,12 +43,11 @@ pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Res
     let r_script_path = tmp.path().join("r-setup.R");
     std::fs::write(&r_script_path, include_str!("../docker/r-setup.R"))?;
 
-    let mut cmd = std::process::Command::new("docker");
+    let mut cmd = podman::command();
+    cmd.args(["run", "--rm"]);
+    cmd.args(podman::identity_args(util::is_rootless()));
+    cmd.args(podman::selinux_args(util::selinux_enforcing()));
     cmd.args([
-        "run",
-        "--rm",
-        "--user",
-        &format!("{}:{}", uid, gid),
         "-e",
         "HOME=/tmp",
         "-e",
