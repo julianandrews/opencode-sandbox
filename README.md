@@ -15,15 +15,19 @@ are instant. Freshness is maintained out-of-band:
 - `opencode-sandbox --build` rebuilds the configured feature variants FROM the newest OpenCode V2 release:
   when `[build] base_image` is unset it queries the registry and uses the newest `2.x` release tag; set
   `base_image` to pin a specific tag instead. This is the only command that queries the registry for the
-  release tag.
+  release tag. It records a pinned or freshly discovered base in
+  `$XDG_DATA_HOME/opencode-sandbox/base-image` (default `~/.local/share/...`); fallback builds keep the
+  previous record, and run-time builds reuse it.
 - A systemd timer runs `--build` daily (see below), so variant images are at most ~1 day behind the latest
   OpenCode V2 release.
 - If a variant image is missing locally (fresh install, pruned cache), a one-time build happens automatically
   on the next run, using only local layers — the base image is pulled only if it is missing too, so variant
   runs never talk to the registry.
 - Feature sets that are *not* in `[build]` variants are rebuilt on every run with
-  `podman build --pull=always`, so they always track the latest base image at the cost of a registry check
-  per run. The run prints a reminder to add the set to `variants` if you use it often.
+  `podman build --pull=always` from the base recorded by the last successful `--build` (or the pin/default
+  if no successful build has recorded one). They do not query the release-tag API themselves; the pull still
+  checks the configured base tag. Add the set to `variants` to have the daily timer keep it current. The run
+  prints a reminder if you use it often.
 
 Rootless Podman typically stores images under `~/.local/share/containers/storage`, separate from Docker's
 store. The R/Rust variants are large; see [Rootless storage](#rootless-storage).
@@ -150,18 +154,20 @@ the shared site library (`R_LIBS_SITE`, see below), which the runtime always rea
 The config file is strict: unknown fields anywhere (top level, `[build]`, or a profile) fail to parse instead
 of being silently ignored.
 
-With the R feature enabled, R's user directories (`tools::R_user_dir()`) are persisted to the host:
-`~/.cache/R` maps to `/opencode/cache/R`, `~/.local/share/R` to `/opencode/data/R`, `~/.config/R` to
-`/opencode/config/R`, and `~/.local/state/R` to `/opencode/state/R`. The R dependency-setup container uses
-the same XDG dirs, so the renv package cache is shared and warm across setup runs and opencode sessions. This
-keeps renv libraries/caches and sass caches writable (the container runs `--read-only`) and warm across runs.
-renv's OS-specific path prefix (`RENV_PATHS_PREFIX_AUTO`) keeps Alpine-container artifacts separate from
-anything produced by R on the host itself.
+With the R feature enabled, R's user directories (`tools::R_user_dir()`) are persisted to the host XDG dirs:
+`$XDG_CACHE_HOME/R` maps to `/opencode/cache/R`, `$XDG_DATA_HOME/R` to `/opencode/data/R`,
+`$XDG_CONFIG_HOME/R` to `/opencode/config/R`, and `$XDG_STATE_HOME/R` to `/opencode/state/R`. Their defaults
+are `~/.cache/R`, `~/.local/share/R`, `~/.config/R`, and `~/.local/state/R`. The R dependency-setup container
+uses the same XDG dirs, so the renv package cache is shared and warm across setup runs and opencode sessions.
+This keeps renv libraries/caches and sass caches writable (the container runs `--read-only`) and warm across
+runs. renv's OS-specific path prefix (`RENV_PATHS_PREFIX_AUTO`) keeps Alpine-container artifacts separate
+from anything produced by R on the host itself.
 
-The shared site library `~/.local/share/opencode-sandbox/r-library` maps to `R_LIBS_SITE=/opt/r-library` in
-both the setup and runtime containers. It is the persistent library for R projects without renv (in-session
-package installs survive across runs, since the container `HOME` is ephemeral) and the fallback target for
-`renv.lock` projects that do not activate renv.
+The shared site library (`$XDG_DATA_HOME/opencode-sandbox/r-library`, defaulting to
+`~/.local/share/opencode-sandbox/r-library`) maps to `R_LIBS_SITE=/opt/r-library` in both the setup and
+runtime containers. It is the persistent library for R projects without renv (in-session package installs
+survive across runs, since the container `HOME` is ephemeral) and the fallback target for `renv.lock`
+projects that do not activate renv.
 
 ## The container user
 
@@ -255,9 +261,10 @@ What the default policy does:
   mount destination. New top-level config files created in a locked run are discarded when the sandbox exits;
   only the runtime files `cli.json`, `service.json` and `tui.json` are copied back. That closes the
   "write a new `opencode.json`/agent/plugin into the rw parent" self-escalation path. Hard `deny` `policies`
-  additionally block tool reads/edits of the credential files, the recorded shell/tool-output archives,
-  `service.json` and the session database regardless of any approval. Policies cannot be overridden by
-  project configs or "allow always" approvals.
+  additionally deny tool reads of the credential files and the session database, and tool edits of the
+  recorded shell/tool-output archives, `service.json` and the session database, regardless of any approval.
+  Reads of the shell/tool-output archives are allowed. Policies cannot be overridden by project configs or
+  "allow always" approvals.
 - **Shell runs without prompting** (V2's allow-by-default base policy keeps the agent productive); only
   `git push` is always denied.
 
@@ -349,8 +356,11 @@ Notes:
 - `Persistent=true` catches up after the machine was off.
 - Manual refresh: `opencode-sandbox --build` or `opencode-sandbox --build --feature R` for a single variant.
 - New releases are picked up automatically: when `base_image` is unset, `--build` prints the resolved release
-  (e.g. `Newest OpenCode V2 release: ghcr.io/anomalyco/opencode:2.2.0`) before building. If the registry is
-  unreachable it falls back to the compiled-in default and warns, so the timer never hard-fails.
+  (e.g. `Newest OpenCode V2 release: ghcr.io/anomalyco/opencode:2.2.0`) before building and records it for
+  later runs. If the registry is unreachable or its tag list is truncated, `--build` keeps existing variant
+  images and uses the last recorded base for any missing one (or the compiled-in fallback if nothing has been
+  recorded), so a transient registry failure cannot downgrade working images. Discovery failure alone does
+  not fail the timer; a missing image or a build failure can still fail it.
 - After building, `--build` runs `podman image prune -f` to drop dangling images and unused Buildah layers.
   Podman has no `--keep-storage` equivalent; monitor `podman system df` if disk usage matters.
 
