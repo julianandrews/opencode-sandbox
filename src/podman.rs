@@ -120,6 +120,12 @@ impl PodmanArgs {
             state.join("opencode"),
             data.join("opencode-sandbox/r-library"),
             data.join("opencode-sandbox/home"),
+            // The built-in plan agent may only write plan files under
+            // ~/.opencode/plan. Create it host-side (like the home itself) so
+            // it exists on the first plan-mode session and is owned by the host
+            // user instead of being created by whatever runs in the container
+            // first.
+            data.join("opencode-sandbox/home/.opencode/plan"),
         ];
         for dir in &dirs_to_create {
             let _ = std::fs::create_dir_all(dir);
@@ -223,6 +229,17 @@ impl PodmanArgs {
         self.args.push("--read-only".into());
         self.args.push("--tmpfs".into());
         self.args.push("/tmp:exec".into());
+        // opencode's own temp dir (`opencode debug paths` -> tmp /tmp/opencode)
+        // is created at startup by whichever opencode process runs first. In
+        // this sandbox that process can be a root-side bootstrap, which leaves
+        // the directory root-owned and therefore unwritable for the runtime
+        // user. A nested tmpfs (mode 1777, like /tmp) shadows that directory
+        // and guarantees writable scratch regardless of who created it.
+        // `mode=1777` is required: without it Podman copies the mountpoint
+        // directory's mode (0755 for a runtime-created dir), and the tmpfs is
+        // not writable by the runtime user.
+        self.args.push("--tmpfs".into());
+        self.args.push("/tmp/opencode:exec,mode=1777".into());
         self
     }
 
@@ -574,6 +591,7 @@ mod tests {
         assert!(args.contains(&"--read-only".to_string()));
         assert!(args.contains(&"--tmpfs".to_string()));
         assert!(args.contains(&"/tmp:exec".to_string()));
+        assert!(args.contains(&"/tmp/opencode:exec,mode=1777".to_string()));
         assert!(!args.contains(&"host.docker.internal:host-gateway".to_string()));
         assert!(args.contains(&"/etc/localtime:/etc/localtime:ro".to_string()));
     }
@@ -755,11 +773,19 @@ mod tests {
         assert!(!content.contains("\"experimental\""));
         // The seed is deliberately minimal: the V2 base policy already allows
         // everything by default (asking only for external directories and
-        // `.env` reads), so on top of it the seed ships two global rules and
-        // one plan-agent exception. The catch-all `*` rule is load-bearing:
-        // without it the base policy's `external_directory * -> ask` applies
-        // and headless agents get blocked on every external path, including
-        // the tmpfs `/tmp` scratch (regression: agents blocked writing /tmp).
+        // `.env` reads), so on top of it the seed ships three global rules.
+        // The catch-all `*` rule is load-bearing: without it the base policy's
+        // `external_directory * -> ask` applies and headless agents get
+        // blocked on every external path, including the tmpfs `/tmp` scratch
+        // (regression: agents blocked writing /tmp).
+        //
+        // The `/tmp` edit rule is global, not an `agents.plan` override:
+        // global rules are evaluated after the plan agent's built-in defaults,
+        // so they cover plan mode too. The legacy `agents` key must stay out
+        // of the seed -- when `agent` and `agents` define the same agent,
+        // opencode lets `agents` win, so seeding `agents.plan` would silently
+        // discard a user's `agent.plan` model/variant/temperature settings.
+        assert!(!content.contains("\"agents\""));
         for rule in [
             "{ \"action\": \"shell\", \"resource\": \"git push *\", \"effect\": \"deny\" }",
             "{ \"action\": \"external_directory\", \"resource\": \"*\", \"effect\": \"allow\" }",

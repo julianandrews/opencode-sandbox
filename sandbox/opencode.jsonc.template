@@ -14,30 +14,28 @@
   // --- Permissions (V2 rules; ordered, last match wins) ---
   //
   // Minimal by design: the base policy already allows everything by default
-  // (prompting only for external directories and .env reads). Two rules
-  // change that: pushes to the host repo are always blocked (the workspace
-  // is host-mounted, so a push outlives the sandbox), and external-directory
-  // prompts are silenced -- the rootfs is an immutable ephemeral image, the
-  // toolchain caches are not secrets, and real credentials are hard-denied
-  // by policies below, never asked about.
+  // (prompting only for external directories and .env reads). The rules below
+  // change that: pushes to the host repo are always blocked (the workspace is
+  // host-mounted, so a push outlives the sandbox), external-directory prompts
+  // are silenced -- the rootfs is an immutable ephemeral image, the toolchain
+  // caches are not secrets, and real credentials are hard-denied by policies
+  // below, never asked about -- and /tmp stays writable.
+  //
+  // The plan agent denies edits except under ~/.opencode/plan. /tmp is
+  // ephemeral scratch (tmpfs in this image), so allowing edits there keeps
+  // plan mode's "no persistent project changes" guarantee intact. This is a
+  // global rule rather than an `agents.plan.permissions` override: global
+  // rules are evaluated after the agent's built-in defaults (last match wins),
+  // so it applies to the plan agent too. The legacy `agents` key must not be
+  // used here: when both `agent` and `agents` define the same agent, opencode
+  // lets the `agents` entry win, so a seeded `agents.plan` would silently
+  // discard a user's `agent.plan` model/variant/temperature (verified with
+  // `opencode debug agents`).
   "permissions": [
     { "action": "shell", "resource": "git push *", "effect": "deny" },
-    { "action": "external_directory", "resource": "*", "effect": "allow" }
+    { "action": "external_directory", "resource": "*", "effect": "allow" },
+    { "action": "edit", "resource": "/tmp/*", "effect": "allow" }
   ],
-
-  // The plan agent denies edits except under ~/.opencode/plan. /tmp is
-  // ephemeral scratch (tmpfs in this image), so restoring edit access there
-  // keeps plan mode's "no persistent project changes" guarantee intact.
-  // Agent rules append after global rules, so this overrides the built-in
-  // deny for /tmp paths; the external_directory allow above covers the
-  // boundary check.
-  "agents": {
-    "plan": {
-      "permissions": [
-        { "action": "edit", "resource": "/tmp/*", "effect": "allow" }
-      ]
-    }
-  },
 
   // Policies are a hard-deny layer: they run after permission rules and saved
   // "allow always" approvals, and project configs cannot lift them. They

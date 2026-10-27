@@ -206,6 +206,9 @@ Runs use the OpenCode V2 release, auto-tracked by `--build` (fallback default `2
   to `$XDG_DATA_HOME/opentui` (`/opencode/data/opentui`). Its Tree-sitter highlight worker caches parsers and
   queries there. Removing the mount makes the worker fail silently and markdown/code highlighting degrade to
   raw text for non-root runs.
+- opencode resolves its temp dir to `/tmp/opencode` (`opencode debug paths`). The sandbox mounts a nested
+  tmpfs there (mode 1777, like `/tmp`): the directory is otherwise created by whichever opencode process runs
+  first, and a root-side bootstrap leaves it root-owned and unwritable for the runtime user.
 - The TUI runs `opencode --standalone` (a private server over stdio) instead of V1's
   `--hostname 0.0.0.0 --port`, which V2 does not accept on the default command. `serve` still takes
   `--hostname`/`--port`, and `run` runs standalone.
@@ -236,9 +239,14 @@ What the default policy does:
   (subagents, `opencode run`) are blocked instead of prompted on every external path. The toolchain homes
   (`CARGO_HOME` registry index and crate sources, R's XDG dirs, `/opencode/cache/opencode`) are build cache
   and need no per-path rules.
-- **Plan mode keeps its scratch.** The built-in `plan` agent denies all edits except opencode plan files; the
-  seed re-allows `edit /tmp/*` for that agent so plan mode can still write tmpfs scratch without touching
-  persistent state.
+- **Plan mode keeps its scratch.** The built-in `plan` agent denies all edits except opencode plan files. The
+  seed adds a global `edit /tmp/* -> allow` rule (global rules run after the agent's built-in defaults, so it
+  covers `plan` too), letting plan mode write tmpfs scratch without touching persistent state. The rule is
+  deliberately global rather than an `agents.plan.permissions` entry: when both `agent` and `agents` define
+  the same agent, opencode lets the `agents` entry win, so seeding one would silently discard your
+  `agent.plan` model/variant/temperature settings. The plan directory itself
+  (`~/.local/share/opencode-sandbox/home/.opencode/plan`) is created host-side with the rest of the home, so
+  it is writable from the first run.
 - **Agents can never modify their own setup.** Every config entry is bind-mounted **read-only** into the
   container, except the runtime-writable regular files `cli.json`, `service.json` and `tui.json`. Symlinked
   entries are mounted read-only even in `--edit-config` runs: they point into the Nix store, where writes
