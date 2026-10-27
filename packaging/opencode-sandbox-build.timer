@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodically rebuild opencode Docker images
+Description=Periodically rebuild opencode-sandbox Podman images
 
 [Timer]
 OnCalendar=daily

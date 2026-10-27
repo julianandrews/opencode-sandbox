@@ -10,10 +10,10 @@ use crate::r;
 use crate::util;
 
 /// Default `opencode.jsonc` seeded into the host config dir on first run
-/// (source: `docker/opencode.jsonc.template`). The file is bind-mounted
+/// (source: `sandbox/opencode.jsonc.template`). The file is bind-mounted
 /// read-only into the container, so an agent can never rewrite its own
 /// permissions, and the `deny` policies inside survive any project config.
-const DEFAULT_OPENCODE_CONFIG: &str = include_str!("../docker/opencode.jsonc.template");
+const DEFAULT_OPENCODE_CONFIG: &str = include_str!("../sandbox/opencode.jsonc.template");
 
 pub const PROGRAM: &str = "podman";
 
@@ -118,8 +118,8 @@ impl PodmanArgs {
             data.join("opencode/bin"),
             data.join("opentui"),
             state.join("opencode"),
-            data.join("opencode-docker/r-library"),
-            data.join("opencode-docker/home"),
+            data.join("opencode-sandbox/r-library"),
+            data.join("opencode-sandbox/home"),
         ];
         for dir in &dirs_to_create {
             let _ = std::fs::create_dir_all(dir);
@@ -130,7 +130,7 @@ impl PodmanArgs {
             self.args.push(format!("{}={}", name, value));
         }
         // A writable, persistent home for the runtime user. The image bakes a
-        // passwd entry matching the host UID (see the Dockerfile), whose home
+        // passwd entry matching the host UID (see the Containerfile), whose home
         // is /opencode/home; mounting it here keeps `~/.ssh` and other
         // user-scoped files writable across runs despite `--read-only`. This
         // is what lets ssh-keygen save its default ~/.ssh/id_* path.
@@ -139,7 +139,7 @@ impl PodmanArgs {
         self.args.push("-v".into());
         self.args.push(format!(
             "{}:/opencode/home",
-            data.join("opencode-docker/home").display()
+            data.join("opencode-sandbox/home").display()
         ));
         self.args.push("-v".into());
         self.args.push(format!(
@@ -239,7 +239,7 @@ impl PodmanArgs {
 
     pub fn r_library(&mut self) -> Result<&mut Self> {
         let data = dirs::data_dir().context("data dir required")?;
-        let r_lib = data.join("opencode-docker/r-library");
+        let r_lib = data.join("opencode-sandbox/r-library");
 
         self.args.push("-e".into());
         self.args.push(format!("R_LIBS_SITE={}", r::R_LIB_SITE));
@@ -475,7 +475,7 @@ fn seed_opencode_config(config_dir: &Path) -> Option<PathBuf> {
 /// default template when none of the recognized names exists.
 ///
 /// Existing configs are never rewritten: the template is only a first-run
-/// default (see `docker/opencode.jsonc.template`). A directory or broken
+/// default (see `sandbox/opencode.jsonc.template`). A directory or broken
 /// symlink squatting on a recognized name is left untouched and blocks
 /// seeding rather than being clobbered.
 fn ensure_opencode_config(config_dir: &Path) -> Result<Option<PathBuf>> {

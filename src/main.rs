@@ -13,7 +13,7 @@ use config::Feature;
 
 #[derive(Parser)]
 #[command(
-    name = "opencode-docker",
+    name = "opencode-sandbox",
     version,
     about = "Run opencode in a Podman container"
 )]
@@ -394,12 +394,12 @@ fn ensure_image(name: &str, features: &[Feature], base_image: &str) -> Result<()
         return build_variant(features, name, base_image, false);
     }
     eprintln!(
-        "Image '{name}' not found locally; building it now (pre-build it with `opencode-docker --build` or the systemd timer to keep startups instant)."
+        "Image '{name}' not found locally; building it now (pre-build it with `opencode-sandbox --build` or the systemd timer to keep startups instant)."
     );
     build_variant(features, name, base_image, false)
 }
 
-const USER_ID_LABEL: &str = "org.opencode-docker.user-ids";
+const USER_ID_LABEL: &str = "org.opencode-sandbox.user-ids";
 
 /// The `USER_ID:USER_GID` baked into the image, read from its label. `None`
 /// when the image or label is absent (an image predating the label, or a
@@ -434,8 +434,8 @@ fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) 
     let has_r = features.contains(&Feature::R);
     let has_rust = features.contains(&Feature::Rust);
     let tmp = tempfile::tempdir()?;
-    let df = tmp.path().join("Dockerfile");
-    std::fs::write(&df, include_str!("../docker/Dockerfile"))?;
+    let df = tmp.path().join("Containerfile");
+    std::fs::write(&df, include_str!("../sandbox/Containerfile"))?;
     let mut cmd = podman::command();
     cmd.args(["build", "-t", tag]);
     if pull {
@@ -477,15 +477,15 @@ mod tests {
     /// wrong CPU and fails the version-check at the end of the RUN.
     const GRPCURL_ARCH_ARMS: [(&str, &str); 2] = [("x86_64", "x86_64"), ("aarch64", "arm64")];
 
-    /// The embedded Dockerfile is the contract for the CLI tools every variant
+    /// The embedded Containerfile is the contract for the CLI tools every variant
     /// ships. grpcurl is packaged for Alpine only in edge/testing, so it has to
     /// come from the version-pinned upstream release tarball (covering both
     /// arches), and `openssl` needs its own apk package: `openssl-dev` provides
     /// headers and pkgconfig only, so without it there is no `openssl` binary.
-    fn check_extra_tools(dockerfile: &str) -> Result<(), String> {
-        let (global, build) = dockerfile
+    fn check_extra_tools(containerfile: &str) -> Result<(), String> {
+        let (global, build) = containerfile
             .split_once("FROM ${BASE_IMAGE}")
-            .ok_or("Dockerfile must build FROM ${BASE_IMAGE}")?;
+            .ok_or("Containerfile must build FROM ${BASE_IMAGE}")?;
         let build_lines: Vec<&str> = build.lines().collect();
 
         // The release asset name embeds the version, so `releases/latest` (which
@@ -508,10 +508,10 @@ mod tests {
 
         // apk cannot supply grpcurl on a stable base, so the upstream release
         // tarball is what actually fetches the binary.
-        if !dockerfile.contains(GRPCURL_URL) {
+        if !containerfile.contains(GRPCURL_URL) {
             return Err("grpcurl must be downloaded from its upstream release tarball".into());
         }
-        if !dockerfile.contains("tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl") {
+        if !containerfile.contains("tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl") {
             return Err("the grpcurl tarball must be extracted into /usr/local/bin".into());
         }
 
@@ -578,13 +578,13 @@ mod tests {
             "ssh -V",
             "import paramiko",
         ] {
-            if !dockerfile.contains(check) {
+            if !containerfile.contains(check) {
                 return Err(format!("the build should end by checking `{check}`"));
             }
         }
         // Token-exact, so the already-present `openssl-dev` cannot satisfy the
         // openssl requirement.
-        if !apk_add_has_package(dockerfile, "openssl") {
+        if !apk_add_has_package(containerfile, "openssl") {
             return Err(
                 "openssl must be added as its own apk package (openssl-dev ships no CLI)".into(),
             );
@@ -593,7 +593,7 @@ mod tests {
         // ssh-keygen comes from; py3-paramiko is Alpine's own build, so it
         // matches the image's python3 instead of a pip one.
         for pkg in ["openssh-client", "py3-paramiko"] {
-            if !apk_add_has_package(dockerfile, pkg) {
+            if !apk_add_has_package(containerfile, pkg) {
                 return Err(format!("{pkg} must be installed in the extra-tools layer"));
             }
         }
@@ -602,22 +602,22 @@ mod tests {
 
     /// Token-exact `apk add` membership, so `openssl-dev` never counts as
     /// `openssl`.
-    fn apk_add_has_package(dockerfile: &str, pkg: &str) -> bool {
-        dockerfile.lines().any(|line| {
+    fn apk_add_has_package(containerfile: &str, pkg: &str) -> bool {
+        containerfile.lines().any(|line| {
             let words: Vec<_> = line.split_whitespace().filter(|w| *w != "RUN").collect();
             words.starts_with(&["apk", "add"]) && words.contains(&pkg)
         })
     }
 
     /// The runtime user contract. The container always runs as the host UID
-    /// (`docker run --user`), so the image must create a passwd entry for it --
+    /// (`podman run --userns=keep-id --user`), so the image must create a passwd entry for it --
     /// otherwise ssh-keygen's `getpwuid(getuid())` fatal ("No user exists for
     /// uid") makes ssh tools unusable. The entry's home must also be a real,
     /// writable dir, since ssh-keygen builds its default key path from it.
-    fn check_runtime_user(dockerfile: &str) -> Result<(), String> {
-        let (_, build) = dockerfile
+    fn check_runtime_user(containerfile: &str) -> Result<(), String> {
+        let (_, build) = containerfile
             .split_once("FROM ${BASE_IMAGE}")
-            .ok_or("Dockerfile must build FROM ${BASE_IMAGE}")?;
+            .ok_or("Containerfile must build FROM ${BASE_IMAGE}")?;
         let build_lines: Vec<&str> = build.lines().collect();
 
         // Build args the CLI passes; without them the layer would always use
@@ -668,8 +668,8 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_creates_runtime_user() {
-        check_runtime_user(include_str!("../docker/Dockerfile")).unwrap();
+    fn containerfile_creates_runtime_user() {
+        check_runtime_user(include_str!("../sandbox/Containerfile")).unwrap();
     }
 
     #[test]
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn runtime_user_contract_detects_regressions() {
-        let original = include_str!("../docker/Dockerfile");
+        let original = include_str!("../sandbox/Containerfile");
         let mutations: Vec<(&str, String)> = vec![
             (
                 "USER_ID arg removed",
@@ -718,20 +718,20 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_ships_extra_tools() {
-        check_extra_tools(include_str!("../docker/Dockerfile")).unwrap();
+    fn containerfile_ships_extra_tools() {
+        check_extra_tools(include_str!("../sandbox/Containerfile")).unwrap();
     }
 
     /// An assertion set that only ever passes proves nothing. Re-run
     /// `check_extra_tools` against deliberately broken copies of the real
-    /// Dockerfile so each invariant is known to still bite. Every mutation is
+    /// Containerfile so each invariant is known to still bite. Every mutation is
     /// derived from the current file (never a hardcoded version or line), so
     /// bumping `GRPCURL_VERSION` -- the documented maintenance step -- keeps
     /// this test green instead of failing on an intended change.
     #[test]
     fn extra_tools_contract_detects_regressions() {
-        // Apply `edit` to the Dockerfile's lines and rejoin, preserving the
-        // trailing newline so the result stays a valid Dockerfile.
+        // Apply `edit` to the Containerfile's lines and rejoin, preserving the
+        // trailing newline so the result stays a valid Containerfile.
         fn mutate(text: &str, edit: impl FnOnce(&mut Vec<String>)) -> String {
             let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
             edit(&mut lines);
@@ -769,7 +769,7 @@ mod tests {
             })
         };
 
-        let original = include_str!("../docker/Dockerfile");
+        let original = include_str!("../sandbox/Containerfile");
         let mutations: Vec<(&str, String)> = vec![
             // Losing the re-declaration is the easiest slip when editing the
             // ARG block, and it surfaces only as a 404 at build time.

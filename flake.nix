@@ -1,5 +1,5 @@
 {
-  description = "Run OpenCode in a Docker sandbox";
+  description = "Run OpenCode in a Podman sandbox";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
@@ -16,24 +16,24 @@
       mkPackage =
         pkgs:
         pkgs.rustPlatform.buildRustPackage {
-          pname = "opencode-docker";
+          pname = "opencode-sandbox";
           version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
-          # The CLI shells out to `docker`; a user-service PATH is minimal, so
+          # The CLI shells out to `podman`; a user-service PATH is minimal, so
           # pin the client into the wrapper rather than relying on the host
           # environment.
           postInstall = ''
-            wrapProgram $out/bin/opencode-docker \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.docker-client ]}
+            wrapProgram $out/bin/opencode-sandbox \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.podman ]}
           '';
 
           meta = {
-            description = "Run OpenCode in a Docker container with the workspace mounted";
-            mainProgram = "opencode-docker";
+            description = "Run OpenCode in a Podman container with the workspace mounted";
+            mainProgram = "opencode-sandbox";
           };
         };
     in
@@ -53,8 +53,8 @@
         };
       });
 
-      # Optional Home Manager integration. `programs.opencode-docker.enable`
-      # installs the CLI; `programs.opencode-docker.build.enable` additionally
+      # Optional Home Manager integration. `programs.opencode-sandbox.enable`
+      # installs the CLI; `programs.opencode-sandbox.build.enable` additionally
       # installs the daily image-rebuild service and timer.
       homeManagerModules.default =
         {
@@ -64,23 +64,23 @@
           ...
         }:
         let
-          cfg = config.programs.opencode-docker;
+          cfg = config.programs.opencode-sandbox;
 
-          serviceName = "opencode-docker-build";
+          serviceName = "opencode-sandbox-build";
         in
         {
-          options.programs.opencode-docker = {
-            enable = lib.mkEnableOption "opencode-docker";
+          options.programs.opencode-sandbox = {
+            enable = lib.mkEnableOption "opencode-sandbox";
 
             package = lib.mkOption {
               type = lib.types.package;
               default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-              defaultText = lib.literalExpression "opencode-docker.packages.<system>.default";
-              description = "The opencode-docker package to install.";
+              defaultText = lib.literalExpression "opencode-sandbox.packages.<system>.default";
+              description = "The opencode-sandbox package to install.";
             };
 
             build = {
-              enable = lib.mkEnableOption "the periodic opencode-docker image rebuild";
+              enable = lib.mkEnableOption "the periodic opencode-sandbox image rebuild";
 
               calendar = lib.mkOption {
                 type = lib.types.str;
@@ -98,7 +98,7 @@
             (lib.mkIf cfg.build.enable {
               systemd.user.services.${serviceName} = {
                 Unit = {
-                  Description = "Build opencode Docker images (feature variants)";
+                  Description = "Build opencode-sandbox Podman images (feature variants)";
                   After = [ "network-online.target" ];
                   Wants = [ "network-online.target" ];
                   StartLimitBurst = 3;
@@ -107,7 +107,7 @@
 
                 Service = {
                   Type = "oneshot";
-                  ExecStart = "${cfg.package}/bin/opencode-docker --build";
+                  ExecStart = "${cfg.package}/bin/opencode-sandbox --build";
                   TimeoutStartSec = "1h";
                   Nice = 10;
                   IOSchedulingClass = "idle";
@@ -119,7 +119,7 @@
               };
 
               systemd.user.timers.${serviceName} = {
-                Unit.Description = "Periodically rebuild opencode Docker images";
+                Unit.Description = "Periodically rebuild opencode-sandbox Podman images";
 
                 Timer = {
                   Unit = "${serviceName}.service";

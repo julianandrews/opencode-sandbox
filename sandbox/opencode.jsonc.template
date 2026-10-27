@@ -1,6 +1,6 @@
 {
-  // Default OpenCode configuration seeded by opencode-docker on first run
-  // (source of truth for src/docker.rs: DEFAULT_OPENCODE_CONFIG).
+  // Default OpenCode configuration seeded by opencode-sandbox on first run
+  // (source of truth for src/podman.rs: DEFAULT_OPENCODE_CONFIG).
   //
   // Edit this file on the HOST. In a normal (locked) run every config entry is
   // additionally mounted read-only (except the regular runtime-writable

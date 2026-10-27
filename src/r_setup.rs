@@ -31,7 +31,7 @@ pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Res
 
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let r_lib_cache = home.join(".local/share/opencode-docker/r-library");
+    let r_lib_cache = home.join(".local/share/opencode-sandbox/r-library");
     fs::create_dir_all(&r_lib_cache)?;
 
     let cwd_basename = cwd
@@ -41,7 +41,7 @@ pub fn check_and_restore(image: &str, env_vars: &HashMap<String, String>) -> Res
 
     let tmp = tempfile::tempdir()?;
     let r_script_path = tmp.path().join("r-setup.R");
-    std::fs::write(&r_script_path, include_str!("../docker/r-setup.R"))?;
+    std::fs::write(&r_script_path, include_str!("../sandbox/r-setup.R"))?;
 
     let mut cmd = podman::command();
     cmd.args(["run", "--rm"]);

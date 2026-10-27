@@ -1,5 +1,5 @@
 # Keep the default in sync with `DEFAULT_BASE_IMAGE` in src/config.rs.
-# Used only when building this Dockerfile directly: `opencode-docker --build`
+# Used only when building this Containerfile directly: `opencode-sandbox --build`
 # overrides it via --build-arg, auto-tracking the newest V2 release when
 # [build] base_image is unset. The `latest` tag still tracks the V1 release,
 # so always pin an explicit V2 tag here.
@@ -76,7 +76,7 @@ RUN apk add --no-cache openssl openssh-client py3-paramiko && \
     python3 -c 'import paramiko'
 
 # Create a passwd entry matching the host UID/GID the container runs as
-# (`docker run --user <uid>:<gid>`). The base image is Alpine and only knows
+# (`podman run --userns=keep-id --user <uid>:<gid>`). The base image is Alpine and only knows
 # root plus system accounts, so without this every ssh tool dies in
 # `getpwuid(getuid())` with "No user exists for uid <uid>" -- ssh-keygen does
 # this at the top of main(), before it even parses `-f`, so the failure cannot

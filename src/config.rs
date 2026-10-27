@@ -61,7 +61,7 @@ pub struct BuildConfig {
 
 /// Fallback base image for `--build` when the registry can't be reached, and
 /// the base used by run-time builds (which never talk to the registry).
-/// Keep in sync with the Dockerfile `ARG BASE_IMAGE` default.
+/// Keep in sync with the Containerfile `ARG BASE_IMAGE` default.
 pub const DEFAULT_BASE_IMAGE: &str = "ghcr.io/anomalyco/opencode:2.0.19";
 
 impl BuildConfig {
@@ -88,7 +88,7 @@ pub struct Profile {
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("opencode-docker/docker-profiles.toml"))
+    Some(dirs::config_dir()?.join("opencode-sandbox/profiles.toml"))
 }
 
 pub fn load_config() -> Result<Config> {
@@ -125,9 +125,9 @@ fn feature_suffix(features: &[Feature]) -> String {
         .collect()
 }
 
-/// Final image name for a feature set, e.g. "opencode-local-r-rust".
+/// Final image name for a feature set, e.g. "opencode-sandbox-r-rust".
 pub fn image_name_for(features: &[Feature]) -> String {
-    format!("opencode-local{}", feature_suffix(features))
+    format!("opencode-sandbox{}", feature_suffix(features))
 }
 
 /// Image variants to pre-build: the configured `[build]` variants if set, otherwise the
@@ -311,12 +311,12 @@ base_image = "ghcr.io/anomalyco/opencode:beta"
 
     #[test]
     fn image_name_for_none() {
-        assert_eq!(image_name_for(&[]), "opencode-local");
+        assert_eq!(image_name_for(&[]), "opencode-sandbox");
     }
 
     #[test]
     fn image_name_for_single() {
-        assert_eq!(image_name_for(&[Feature::Rust]), "opencode-local-rust");
+        assert_eq!(image_name_for(&[Feature::Rust]), "opencode-sandbox-rust");
     }
 
     #[test]
@@ -327,7 +327,7 @@ base_image = "ghcr.io/anomalyco/opencode:beta"
         );
         assert_eq!(
             image_name_for(&[Feature::R, Feature::Rust]),
-            "opencode-local-r-rust"
+            "opencode-sandbox-r-rust"
         );
     }
 
@@ -335,7 +335,7 @@ base_image = "ghcr.io/anomalyco/opencode:beta"
     fn image_name_for_dedup() {
         assert_eq!(
             image_name_for(&[Feature::R, Feature::Rust, Feature::R]),
-            "opencode-local-r-rust",
+            "opencode-sandbox-r-rust",
         );
     }
 
@@ -453,11 +453,11 @@ mounts = ["~/data"]
     fn config_rejects_unknown_profile_field() {
         let toml_str = r#"
 [profile.intake]
-dockerfile = "intake"
+containerfile = "intake"
 build_context = "/home/julian/Code/intake"
 "#;
         let err = toml::from_str::<Config>(toml_str).unwrap_err();
-        assert!(err.to_string().contains("dockerfile"));
+        assert!(err.to_string().contains("containerfile"));
     }
 
     #[test]
