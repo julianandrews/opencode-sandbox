@@ -19,7 +19,8 @@ are instant. Freshness is maintained out-of-band:
   `$XDG_DATA_HOME/opencode-sandbox/base-image` (default `~/.local/share/...`); fallback builds keep the
   previous record, and run-time builds reuse it.
 - A systemd timer runs `--build` daily (see below), so variant images are at most ~1 day behind the latest
-  OpenCode V2 release.
+  OpenCode V2 release. The service passes `--wait-for-registry`, so a laptop that wakes before its network
+  is ready waits for the registry instead of silently skipping the run.
 - If a variant image is missing locally (fresh install, pruned cache), a one-time build happens automatically
   on the next run, using only local layers — the base image is pulled only if it is missing too, so variant
   runs never talk to the registry.
@@ -84,6 +85,7 @@ The flake exposes `packages.default` and a Home Manager module:
     # Optional: rebuild the configured image variants daily with a user timer.
     build.enable = true;
     # build.calendar = "daily";
+    # build.waitForRegistry = 300;
   };
 }
 ```
@@ -333,9 +335,9 @@ profile.
 
 ## Keeping images fresh with systemd
 
-The timer runs `opencode-sandbox --build` once a day and rebuilds only what changed: with
-`[build] base_image` unset it resolves the newest OpenCode V2 release and the `--pull=always` build is a cache
-hit when there is no new release. Install it for your user:
+The timer runs `opencode-sandbox --build --wait-for-registry=300` once a day and rebuilds only what changed:
+with `[build] base_image` unset it resolves the newest OpenCode V2 release and the `--pull=always` build is a
+cache hit when there is no new release. Install it for your user:
 
 ```sh
 install -m644 packaging/opencode-sandbox-build.timer packaging/opencode-sandbox-build.service \
@@ -353,14 +355,21 @@ Notes:
 - The build runs at idle priority (`Nice=10`, `IOSchedulingClass=idle`) so it never slows down foreground
   work.
 - On headless machines, run `loginctl enable-linger $USER` so user units start at boot.
-- `Persistent=true` catches up after the machine was off.
+- `Persistent=true` catches up after the machine was off, and calendar timers also catch up after suspend.
+  The service waits for the registry to become reachable before building, because a user unit's
+  `network-online.target` is not tied to the host's network. If the registry is still unreachable after the
+  wait, the unit fails so systemd can retry instead of consuming the day's run.
+- The service allows three starts per hour, including the first attempt. A wait timeout is a failure, so
+  `Restart=on-failure` retries after 30 seconds until the start limit is reached.
 - Manual refresh: `opencode-sandbox --build` or `opencode-sandbox --build --feature R` for a single variant.
+  Add `--wait-for-registry=300` to wait for the registry first.
 - New releases are picked up automatically: when `base_image` is unset, `--build` prints the resolved release
   (e.g. `Newest OpenCode V2 release: ghcr.io/anomalyco/opencode:2.2.0`) before building and records it for
-  later runs. If the registry is unreachable or its tag list is truncated, `--build` keeps existing variant
-  images and uses the last recorded base for any missing one (or the compiled-in fallback if nothing has been
-  recorded), so a transient registry failure cannot downgrade working images. Discovery failure alone does
-  not fail the timer; a missing image or a build failure can still fail it.
+  later runs. Without `--wait-for-registry`, a discovery failure keeps existing variant images and uses the
+  last recorded base for any missing one (or the compiled-in fallback if nothing has been recorded), so a
+  transient registry failure cannot downgrade working images. With `--wait-for-registry`, transport failures
+  are retried until the timeout and then fail so the service can retry. A truncated tag list still keeps
+  existing images.
 - After building, `--build` runs `podman image prune -f` to drop dangling images and unused Buildah layers.
   Podman has no `--keep-storage` equivalent; monitor `podman system df` if disk usage matters.
 

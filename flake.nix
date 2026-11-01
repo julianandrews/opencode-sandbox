@@ -87,6 +87,12 @@
                 default = "daily";
                 description = "systemd OnCalendar expression for the image rebuild.";
               };
+
+              waitForRegistry = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 300;
+                description = "Seconds to wait for the container registry to become reachable before failing the image rebuild (the service's total start timeout is 90 minutes).";
+              };
             };
           };
 
@@ -99,16 +105,21 @@
               systemd.user.services.${serviceName} = {
                 Unit = {
                   Description = "Build opencode-sandbox Podman images (feature variants)";
-                  After = [ "network-online.target" ];
-                  Wants = [ "network-online.target" ];
+                  # network-online.target is not meaningful in a user manager:
+                  # it is not tied to the host's network. The build waits for
+                  # the registry itself.
                   StartLimitBurst = 3;
-                  StartLimitIntervalSec = "10min";
+                  # A retry attempt includes the registry wait, so the
+                  # rate-limit window must be longer than one attempt.
+                  # Otherwise the counter resets between waits and the
+                  # service can retry indefinitely.
+                  StartLimitIntervalSec = "1h";
                 };
 
                 Service = {
                   Type = "oneshot";
-                  ExecStart = "${cfg.package}/bin/opencode-sandbox --build";
-                  TimeoutStartSec = "1h";
+                  ExecStart = "${cfg.package}/bin/opencode-sandbox --build --wait-for-registry=${toString cfg.build.waitForRegistry}";
+                  TimeoutStartSec = "90min";
                   Nice = 10;
                   IOSchedulingClass = "idle";
                   Restart = "on-failure";

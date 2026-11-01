@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REGISTRY: &str = "ghcr.io";
 const REPOSITORY: &str = "anomalyco/opencode";
@@ -34,6 +34,7 @@ struct TagsResponse {
 }
 
 /// Result of a registry release lookup.
+#[derive(Debug)]
 pub struct Latest {
     /// The newest `2.x.y` release image reference, e.g.
     /// `ghcr.io/anomalyco/opencode:2.0.19`, or `None` when the registry
@@ -63,6 +64,68 @@ pub fn latest_base_image() -> Result<Latest> {
         image: parse_latest_v2(&tags).map(|tag| format!("{REGISTRY}/{REPOSITORY}:{tag}")),
         truncated,
     })
+}
+
+/// Look up the newest OpenCode V2 release, retrying transport failures until
+/// `timeout` elapses. `--build --wait-for-registry` uses this so a machine
+/// that wakes before its network is ready does not silently skip the run.
+///
+/// A successful lookup is returned immediately. A truncated tag list is also
+/// returned as-is: truncation is a deterministic result, not a transport
+/// failure, and the caller's existing keep-images fallback handles it.
+pub fn latest_base_image_with_retry(timeout: Duration) -> Result<Latest> {
+    latest_base_image_with_retry_using(
+        latest_base_image,
+        timeout,
+        Duration::from_secs(5),
+        std::thread::sleep,
+    )
+}
+
+fn latest_base_image_with_retry_using(
+    mut discover: impl FnMut() -> Result<Latest>,
+    timeout: Duration,
+    initial_delay: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<Latest> {
+    let deadline = Instant::now() + timeout;
+    let mut delay = initial_delay;
+    let mut first_failure = true;
+
+    loop {
+        match discover() {
+            Ok(latest) => return Ok(latest),
+            Err(err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "registry did not become reachable within {}s",
+                            timeout.as_secs()
+                        )
+                    });
+                }
+
+                let remaining = deadline.saturating_duration_since(now);
+                let sleep_for = delay.min(remaining);
+                if first_failure {
+                    eprintln!(
+                        "Registry not reachable ({err:#}); waiting up to {}s...",
+                        timeout.as_secs()
+                    );
+                    first_failure = false;
+                } else {
+                    eprintln!(
+                        "Registry still not reachable ({err:#}); retrying in {}s ({}s left)...",
+                        sleep_for.as_secs(),
+                        remaining.as_secs()
+                    );
+                }
+                sleep(sleep_for);
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
 }
 
 fn fetch_token(agent: &ureq::Agent) -> Result<String> {
@@ -262,5 +325,53 @@ mod tests {
             Some("https://ghcr.io/v2/anomalyco/opencode/tags/list?last=2.0.9&n=1000".to_string())
         );
         assert_eq!(next_url(""), None);
+    }
+
+    #[test]
+    fn retries_until_discovery_succeeds() {
+        let attempts = std::cell::Cell::new(0);
+        let latest = latest_base_image_with_retry_using(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(anyhow::anyhow!("offline"))
+                } else {
+                    Ok(Latest {
+                        image: Some("ghcr.io/anomalyco/opencode:2.0.19".to_string()),
+                        truncated: false,
+                    })
+                }
+            },
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            latest.image.as_deref(),
+            Some("ghcr.io/anomalyco/opencode:2.0.19")
+        );
+    }
+
+    #[test]
+    fn retry_gives_up_at_deadline() {
+        let attempts = std::cell::Cell::new(0);
+        let err = latest_base_image_with_retry_using(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(anyhow::anyhow!("offline"))
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), 1);
+        assert!(err
+            .to_string()
+            .contains("registry did not become reachable"));
     }
 }

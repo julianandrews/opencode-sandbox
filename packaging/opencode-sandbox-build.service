@@ -1,15 +1,22 @@
 [Unit]
 Description=Build opencode-sandbox Podman images (feature variants)
 Documentation=man:opencode-sandbox
-After=network-online.target
-Wants=network-online.target
+# network-online.target is not meaningful in a user manager: it is not tied
+# to the host's network. The build waits for the registry itself.
+StartLimitBurst=3
+# A retry attempt includes the registry wait, so the rate-limit window must
+# be longer than one attempt. Otherwise the counter resets between waits and
+# the service can retry indefinitely.
+StartLimitIntervalSec=1h
 
 [Service]
 Type=oneshot
-TimeoutStartSec=3600
-ExecStart=%h/.local/bin/opencode-sandbox --build
+TimeoutStartSec=90min
+ExecStart=%h/.local/bin/opencode-sandbox --build --wait-for-registry=300
 Nice=10
 IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=30s
 
 [Install]
 WantedBy=default.target

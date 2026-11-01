@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 mod config;
 mod path;
@@ -65,6 +66,17 @@ struct Cli {
         conflicts_with_all = &["profile", "port", "mount", "audio", "env", "no_default_features", "edit_config"]
     )]
     build: bool,
+
+    #[arg(
+        long = "wait-for-registry",
+        value_name = "SECONDS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "300",
+        requires = "build",
+        help = "Wait up to SECONDS for the container registry to become reachable before giving up (default: 300). Only valid with --build"
+    )]
+    wait_for_registry: Option<u64>,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -319,7 +331,10 @@ fn cmd_build(cli: &Cli) -> Result<()> {
         vec![cli.feature.clone()]
     };
 
-    let selection = build_base_image(&cfg);
+    let selection = match cli.wait_for_registry {
+        Some(seconds) => build_base_image_waiting(&cfg, Duration::from_secs(seconds))?,
+        None => build_base_image(&cfg),
+    };
     let base_image = selection.image;
     let discovered = selection.discovered;
     if !discovered {
@@ -375,6 +390,30 @@ fn build_base_image(cfg: &config::Config) -> BaseImageSelection {
     build_base_image_with(cfg, registry::latest_base_image, recorded.as_deref())
 }
 
+/// The base image for a `--build --wait-for-registry` run. Unlike the default
+/// path, a transport failure after the wait is an error: a systemd timer run
+/// must not exit successfully and consume its daily trigger when the registry
+/// was simply not reachable yet.
+fn build_base_image_waiting(cfg: &config::Config, timeout: Duration) -> Result<BaseImageSelection> {
+    let recorded = recorded_base_image();
+    if let Some(pin) = &cfg.build.base_image {
+        // A pinned base skips release discovery, but the build still pulls
+        // from the registry. Probe it through the same retry path so a wake
+        // before the network is ready does not immediately fail the pull.
+        registry::latest_base_image_with_retry(timeout)
+            .context("registry did not become reachable; existing images were left untouched")?;
+        println!("Using pinned base image {pin}");
+        return Ok(BaseImageSelection {
+            image: pin.clone(),
+            discovered: true,
+        });
+    }
+
+    let latest = registry::latest_base_image_with_retry(timeout)
+        .context("registry did not become reachable; existing images were left untouched")?;
+    Ok(selection_from_latest(latest, recorded.as_deref()))
+}
+
 fn build_base_image_with(
     cfg: &config::Config,
     discover: impl Fn() -> Result<registry::Latest>,
@@ -388,39 +427,10 @@ fn build_base_image_with(
         };
     }
 
-    let fallback = || recorded.unwrap_or(config::DEFAULT_BASE_IMAGE).to_string();
     match discover() {
-        Ok(latest) if latest.truncated => {
-            let image = fallback();
-            eprintln!(
-                "Warning: registry tag list was cut off before it ended; using {image} instead of the partial result. Pin one with [build] base_image."
-            );
-            BaseImageSelection {
-                image,
-                discovered: false,
-            }
-        }
-        Ok(latest) => match latest.image {
-            Some(image) => {
-                println!("Newest OpenCode V2 release: {image}");
-                BaseImageSelection {
-                    image,
-                    discovered: true,
-                }
-            }
-            None => {
-                let image = fallback();
-                eprintln!(
-                    "Warning: registry has no 2.x release tags; using {image}. Pin one with [build] base_image."
-                );
-                BaseImageSelection {
-                    image,
-                    discovered: false,
-                }
-            }
-        },
+        Ok(latest) => selection_from_latest(latest, recorded),
         Err(err) => {
-            let image = fallback();
+            let image = fallback_image(recorded);
             eprintln!(
                 "Warning: could not check the registry for the newest OpenCode V2 release ({err:#}); using {image}. Pin one with [build] base_image."
             );
@@ -430,6 +440,47 @@ fn build_base_image_with(
             }
         }
     }
+}
+
+/// Turn a successful registry result into the base image selection. A
+/// truncated list and a complete list with no V2 tags are both unusable for a
+/// fresh discovery, so they keep the recorded/default base and leave existing
+/// images alone.
+fn selection_from_latest(latest: registry::Latest, recorded: Option<&str>) -> BaseImageSelection {
+    if latest.truncated {
+        let image = fallback_image(recorded);
+        eprintln!(
+            "Warning: registry tag list was cut off before it ended; using {image} instead of the partial result. Pin one with [build] base_image."
+        );
+        return BaseImageSelection {
+            image,
+            discovered: false,
+        };
+    }
+
+    match latest.image {
+        Some(image) => {
+            println!("Newest OpenCode V2 release: {image}");
+            BaseImageSelection {
+                image,
+                discovered: true,
+            }
+        }
+        None => {
+            let image = fallback_image(recorded);
+            eprintln!(
+                "Warning: registry has no 2.x release tags; using {image}. Pin one with [build] base_image."
+            );
+            BaseImageSelection {
+                image,
+                discovered: false,
+            }
+        }
+    }
+}
+
+fn fallback_image(recorded: Option<&str>) -> String {
+    recorded.unwrap_or(config::DEFAULT_BASE_IMAGE).to_string()
 }
 
 fn base_image_state_path_for(data_dir: &Path) -> PathBuf {
@@ -1213,5 +1264,18 @@ base_image = "ghcr.io/anomalyco/opencode:2.0.18"
             read_base_image(&path).as_deref(),
             Some("ghcr.io/anomalyco/opencode:2.2.0")
         );
+    }
+
+    #[test]
+    fn wait_for_registry_requires_build_and_parses_seconds() {
+        assert!(Cli::try_parse_from(["opencode-sandbox", "--wait-for-registry"]).is_err());
+
+        let cli =
+            Cli::try_parse_from(["opencode-sandbox", "--build", "--wait-for-registry=42"]).unwrap();
+        assert_eq!(cli.wait_for_registry, Some(42));
+
+        let cli =
+            Cli::try_parse_from(["opencode-sandbox", "--build", "--wait-for-registry"]).unwrap();
+        assert_eq!(cli.wait_for_registry, Some(300));
     }
 }
