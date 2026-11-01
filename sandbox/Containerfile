@@ -6,6 +6,7 @@
 ARG BASE_IMAGE=ghcr.io/anomalyco/opencode:2.0.19
 ARG INCLUDE_R=false
 ARG INCLUDE_RUST=false
+ARG INCLUDE_NIX=false
 # grpcurl is packaged for Alpine only in edge/testing, so it cannot come from
 # apk on a stable base; it is installed from the upstream release tarball below
 # instead. Pinned (unlike dbmate, which can use releases/latest) because the
@@ -75,6 +76,30 @@ RUN apk add --no-cache openssl openssh-client py3-paramiko && \
     ssh -V && \
     python3 -c 'import paramiko'
 
+# Nix is opt-in. Alpine's package is built for a multi-user install with a
+# daemon and nixbld build users; the sandbox runs single-user as the host UID,
+# so replace its nix.conf with single-user settings. `sandbox = false` avoids
+# requiring nested user/mount namespaces inside the rootless container; builds
+# still run as the unprivileged container user, with the container as the trust
+# boundary. The store itself is bind-mounted from the host at run time (see
+# PodmanArgs::nix), so create the mount targets here.
+#
+# Declared immediately before its only consumer, like GRPCURL_VERSION, so
+# toggling Nix does not invalidate the expensive R/Rust or extra-tools layers.
+ARG INCLUDE_NIX
+RUN if [ "$INCLUDE_NIX" = "true" ]; then \
+        apk add --no-cache nix ca-certificates && \
+        mkdir -p /nix /opencode/cache/nix /opencode/state/nix && \
+        printf '%s\n' \
+            'experimental-features = nix-command flakes' \
+            'sandbox = false' \
+            'build-users-group =' \
+            'max-jobs = auto' \
+            > /etc/nix/nix.conf && \
+        nix --version && \
+        nix config show >/dev/null; \
+    fi
+
 # Create a passwd entry matching the host UID/GID the container runs as
 # (`podman run --userns=keep-id --user <uid>:<gid>`). The base image is Alpine and only knows
 # root plus system accounts, so without this every ssh tool dies in
@@ -106,6 +131,6 @@ RUN if getent passwd "$USER_ID" >/dev/null; then \
     su opencode -c 'ssh-keygen -t ed25519 -N "" -f /tmp/opencode-user-check -C "build check"' && \
     rm -f /tmp/opencode-user-check /tmp/opencode-user-check.pub
 
-ENV PATH=/usr/local/cargo/bin:$PATH \
+ENV PATH=/opencode/home/.nix-profile/bin:/usr/local/cargo/bin:$PATH \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo

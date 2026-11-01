@@ -222,6 +222,9 @@ fn run_container(cfg: &config::ResolvedConfig, image: &str, extra_args: &[String
     if cfg.features.contains(&Feature::Rust) {
         da.cargo_home()?;
     }
+    if cfg.features.contains(&Feature::Nix) {
+        da.nix()?;
+    }
 
     let podman_args = da.into_vec();
 
@@ -624,6 +627,7 @@ fn current_user_ids() -> String {
 fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) -> Result<()> {
     let has_r = features.contains(&Feature::R);
     let has_rust = features.contains(&Feature::Rust);
+    let has_nix = features.contains(&Feature::Nix);
     let tmp = tempfile::tempdir()?;
     let df = tmp.path().join("Containerfile");
     std::fs::write(&df, include_str!("../sandbox/Containerfile"))?;
@@ -645,6 +649,7 @@ fn build_variant(features: &[Feature], tag: &str, base_image: &str, pull: bool) 
         cmd.args(["--build-arg", "INCLUDE_R=true"]);
     }
     cmd.args(["--build-arg", &format!("INCLUDE_RUST={has_rust}")]);
+    cmd.args(["--build-arg", &format!("INCLUDE_NIX={has_nix}")]);
     cmd.arg(tmp.path());
     let status = cmd.status().context("failed to run podman build")?;
     if !status.success() {
@@ -800,6 +805,75 @@ mod tests {
         })
     }
 
+    /// The Nix feature contract. Alpine's package is built for a multi-user
+    /// install; the sandbox runs single-user, so the packaged nix.conf must be
+    /// replaced (no nixbld build users, no per-build sandbox). Toggling Nix
+    /// must not invalidate the R/Rust layers, so the ARG sits immediately
+    /// before its only consumer. The build ends with a smoke test so a broken
+    /// install fails the image build instead of the first agent session.
+    fn check_nix(containerfile: &str) -> Result<(), String> {
+        let (global, build) = containerfile
+            .split_once("FROM ${BASE_IMAGE}")
+            .ok_or("Containerfile must build FROM ${BASE_IMAGE}")?;
+        if !global.lines().any(|l| l.trim() == "ARG INCLUDE_NIX=false") {
+            return Err("ARG INCLUDE_NIX must default to false before FROM".into());
+        }
+
+        let build_lines: Vec<&str> = build.lines().collect();
+        let arg_at = build_lines
+            .iter()
+            .position(|l| l.trim() == "ARG INCLUDE_NIX")
+            .ok_or("ARG INCLUDE_NIX must be re-declared after FROM")?;
+        let run_at = build_lines
+            .iter()
+            .position(|l| l.contains(r#"RUN if [ "$INCLUDE_NIX" = "true" ]"#))
+            .ok_or("the Nix layer must start with its INCLUDE_NIX guard")?;
+        if arg_at + 1 != run_at {
+            return Err(
+                "ARG INCLUDE_NIX must be declared immediately before the Nix RUN, or \
+                 toggling it would invalidate the R/Rust layers"
+                    .into(),
+            );
+        }
+
+        // Scope the checks to the Nix RUN (including its backslash
+        // continuations), so unrelated layers cannot satisfy them.
+        let mut run_block = Vec::new();
+        for line in &build_lines[run_at..] {
+            run_block.push(*line);
+            if !line.trim_end().ends_with('\\') {
+                break;
+            }
+        }
+        let run_block = run_block.join("\n");
+
+        if !run_block.contains(r#"if [ "$INCLUDE_NIX" = "true" ]"#) {
+            return Err("the nix package install must be gated on INCLUDE_NIX".into());
+        }
+        if !apk_add_has_package(&run_block, "nix") {
+            return Err("the Nix layer must install the nix package".into());
+        }
+        for token in [
+            "mkdir -p /nix",
+            "experimental-features = nix-command flakes",
+            "sandbox = false",
+            "build-users-group =",
+            "max-jobs = auto",
+            "nix --version",
+            "nix config show",
+        ] {
+            if !run_block.contains(token) {
+                return Err(format!("the Nix layer must contain `{token}`"));
+            }
+        }
+        if run_block.contains("nixbld") {
+            return Err(
+                "the container runs Nix single-user; build-users-group must be empty".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// The runtime user contract. The container always runs as the host UID
     /// (`podman run --userns=keep-id --user`), so the image must create a passwd entry for it --
     /// otherwise ssh-keygen's `getpwuid(getuid())` fatal ("No user exists for
@@ -911,6 +985,54 @@ mod tests {
     #[test]
     fn containerfile_ships_extra_tools() {
         check_extra_tools(include_str!("../sandbox/Containerfile")).unwrap();
+    }
+
+    #[test]
+    fn containerfile_ships_nix_feature() {
+        check_nix(include_str!("../sandbox/Containerfile")).unwrap();
+    }
+
+    #[test]
+    fn nix_contract_detects_regressions() {
+        let original = include_str!("../sandbox/Containerfile");
+        let mutations: Vec<(&str, String)> = vec![
+            (
+                "post-FROM ARG removed",
+                original.replace("ARG INCLUDE_NIX\n", ""),
+            ),
+            (
+                "unpinned default removed",
+                original.replace("ARG INCLUDE_NIX=false\n", ""),
+            ),
+            (
+                "nix package removed",
+                original.replace("apk add --no-cache nix", "apk add --no-cache nix-bin"),
+            ),
+            (
+                "sandbox enabled",
+                original.replace("sandbox = false", "sandbox = true"),
+            ),
+            (
+                "nixbld build users retained",
+                original.replace("'build-users-group ='", "'build-users-group = nixbld'"),
+            ),
+            (
+                "smoke test removed",
+                original.replace("nix --version", "true"),
+            ),
+            (
+                "store mount target removed",
+                original.replace("mkdir -p /nix ", "mkdir -p "),
+            ),
+        ];
+
+        for (name, mutated) in mutations {
+            assert_ne!(mutated, original, "mutation '{name}' changed nothing");
+            assert!(
+                check_nix(&mutated).is_err(),
+                "mutation '{name}' slipped past the contract check"
+            );
+        }
     }
 
     /// An assertion set that only ever passes proves nothing. Re-run

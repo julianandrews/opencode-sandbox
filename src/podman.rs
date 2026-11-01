@@ -57,6 +57,24 @@ pub struct PodmanArgs {
     args: Vec<String>,
 }
 
+/// Host paths persisted for the `Nix` feature. The store is shared by every
+/// Nix-enabled sandbox run for the same host user; the cache and state dirs
+/// keep flake evaluation and installed profiles warm across runs.
+#[derive(Debug, PartialEq, Eq)]
+struct NixPaths {
+    store: PathBuf,
+    cache: PathBuf,
+    state: PathBuf,
+}
+
+fn nix_paths_in(data: &Path, cache: &Path, state: &Path) -> NixPaths {
+    NixPaths {
+        store: data.join("opencode-sandbox/nix"),
+        cache: cache.join("nix"),
+        state: state.join("nix"),
+    }
+}
+
 /// The workspace name for a host path. `/` has no final component, so it
 /// becomes `root`; this also keeps `-m /` from panicking.
 fn path_basename(path: &Path) -> String {
@@ -222,6 +240,51 @@ impl PodmanArgs {
         self.args.push("-v".into());
         self.args
             .push(format!("{}:/opencode/cargo", data.join("cargo").display()));
+        Ok(self)
+    }
+
+    /// Mount the persistent Nix store, evaluation cache, and profile state for
+    /// the `Nix` feature. Nix runs single-user (no daemon), so the store and
+    /// Nix's XDG cache/state dirs must all be writable. The store is shared by
+    /// every Nix-enabled sandbox run for the same host user.
+    pub fn nix(&mut self) -> Result<&mut Self> {
+        let data = dirs::data_dir().context("data dir required")?;
+        let cache = dirs::cache_dir().context("cache dir required")?;
+        let state = match dirs::state_dir() {
+            Some(s) => s,
+            None => dirs::home_dir()
+                .context("home dir required")?
+                .join(".local/state"),
+        };
+        self.nix_dirs(&nix_paths_in(&data, &cache, &state))
+    }
+
+    fn nix_dirs(&mut self, paths: &NixPaths) -> Result<&mut Self> {
+        for dir in [&paths.store, &paths.cache, &paths.state] {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create '{}'", dir.display()))?;
+        }
+        // Force the local store: the image has no nix-daemon socket, and
+        // `auto` must not fall back to Nix's per-user chroot store.
+        self.args.push("-e".into());
+        self.args.push("NIX_REMOTE=local".into());
+        self.args.push("-e".into());
+        self.args
+            .push("NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt".into());
+        // Nix store paths are absolute, so the store is always mounted at the
+        // conventional /nix path. The directory itself lives under the host
+        // data dir so it persists across runs and image rebuilds.
+        self.args.push("-v".into());
+        self.args.push(format!("{}:/nix", paths.store.display()));
+        // Nix's eval cache and per-user profiles honor the container's XDG
+        // dirs. Persist them so flakes stay warm and `nix profile install`
+        // survives across runs.
+        self.args.push("-v".into());
+        self.args
+            .push(format!("{}:/opencode/cache/nix", paths.cache.display()));
+        self.args.push("-v".into());
+        self.args
+            .push(format!("{}:/opencode/state/nix", paths.state.display()));
         Ok(self)
     }
 
@@ -1072,6 +1135,55 @@ mod tests {
         let args = da.into_vec();
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"127.0.0.1:8080:8080".to_string()));
+    }
+
+    #[test]
+    fn nix_paths_live_under_xdg_dirs() {
+        let paths = nix_paths_in(Path::new("/data"), Path::new("/cache"), Path::new("/state"));
+        assert_eq!(paths.store, PathBuf::from("/data/opencode-sandbox/nix"));
+        assert_eq!(paths.cache, PathBuf::from("/cache/nix"));
+        assert_eq!(paths.state, PathBuf::from("/state/nix"));
+    }
+
+    #[test]
+    fn nix_mounts_persistent_store_cache_and_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = nix_paths_in(
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+            &tmp.path().join("state"),
+        );
+        let mut da = PodmanArgs::new();
+        da.nix_dirs(&paths).unwrap();
+        let args = da.into_vec();
+
+        // The store, eval cache, and profile state must all be writable and
+        // persistent; without the last two `nix profile install` and warm
+        // flake evaluation fail on the read-only rootfs.
+        for (host, target) in [
+            (&paths.store, "/nix"),
+            (&paths.cache, "/opencode/cache/nix"),
+            (&paths.state, "/opencode/state/nix"),
+        ] {
+            assert!(host.is_dir(), "{} was not created", host.display());
+            assert!(
+                args.contains(&format!("{}:{}", host.display(), target)),
+                "missing rw mount for {target}: {args:?}"
+            );
+        }
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-e".to_string(), "NIX_REMOTE=local".to_string()]),
+            "NIX_REMOTE=local missing: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w
+                == [
+                    "-e".to_string(),
+                    "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt".to_string(),
+                ]),
+            "NIX_SSL_CERT_FILE missing: {args:?}"
+        );
     }
 
     #[test]

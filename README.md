@@ -1,7 +1,7 @@
 # opencode-sandbox
 
 Run [opencode](https://opencode.ai) inside a Podman container with your workspace mounted in, XDG state
-persisted, and optional feature toolchains (R, Rust).
+persisted, and optional feature toolchains (R, Rust, Nix).
 
 `opencode-sandbox` is the renamed successor to `opencode-docker`; see the
 [migration section](#migrating-from-opencode-docker).
@@ -9,7 +9,7 @@ persisted, and optional feature toolchains (R, Rust).
 ## How it works
 
 Runs use the pre-built image for your feature set (`opencode-sandbox`, `opencode-sandbox-r`,
-`opencode-sandbox-rust`, `opencode-sandbox-r-rust`) when that set is one of the `[build]` variants, so startups
+`opencode-sandbox-rust`, `opencode-sandbox-nix`, ...) when that set is one of the `[build]` variants, so startups
 are instant. Freshness is maintained out-of-band:
 
 - `opencode-sandbox --build` rebuilds the configured feature variants FROM the newest OpenCode V2 release:
@@ -135,7 +135,7 @@ ports = [8080]
 # edit_config = true   # make config editable in-container; syncs back on exit (see Permissions)
 ```
 
-Image names are canonical: features are deduplicated, sorted (R before Rust), and lowercased, so
+Image names are canonical: features are deduplicated, sorted (R before Rust before Nix), and lowercased, so
 `opencode-sandbox-r-rust` is the same whether the features came from the CLI, a profile, or
 `default_features`. Feature precedence is "most specific wins": a profile's `features` replace
 `default_features`, and `--feature` on the command line replaces both. `--no-default-features` drops
@@ -170,6 +170,60 @@ The shared site library (`$XDG_DATA_HOME/opencode-sandbox/r-library`, defaulting
 runtime containers. It is the persistent library for R projects without renv (in-session package installs
 survive across runs, since the container `HOME` is ephemeral) and the fallback target for `renv.lock`
 projects that do not activate renv.
+
+### Nix toolchain
+
+The `Nix` feature installs Alpine's Nix package and runs it in single-user mode: no daemon and no root. The
+package's multi-user build users are created by `apk` but left unused. Enable it per run or in a profile:
+
+```sh
+opencode-sandbox --feature Nix
+```
+
+```toml
+default_features = ["Nix"]
+```
+
+The daily `--build` pre-builds the no-feature image plus `default_features`, or the explicit `[build]`
+variants when set. If you enable Nix only with `--feature Nix` or in a profile, add `["Nix"]` (and any
+combinations you use, e.g. `["R", "Nix"]`) to `[build] variants`, or put `Nix` in `default_features`, to
+keep startups instant. To pre-build the Nix image once without changing the config:
+
+```sh
+opencode-sandbox --build --feature Nix
+```
+
+Nix's store is persistent and shared by every Nix-enabled sandbox run for the same host user:
+
+- `$XDG_DATA_HOME/opencode-sandbox/nix` (default `~/.local/share/opencode-sandbox/nix`) is mounted at `/nix`
+  and holds the store, database, and GC roots.
+- `$XDG_CACHE_HOME/nix` (default `~/.cache/nix`) is Nix's evaluation cache.
+- `$XDG_STATE_HOME/nix` (default `~/.local/state/nix`) holds per-user profiles, so `nix profile install`
+  survives across runs. `/opencode/home/.nix-profile/bin` is on `PATH`.
+
+The store is independent of any host Nix installation: the sandbox never mounts the host `/nix/store` or
+talks to the host daemon, so packages are fetched into the sandbox store even when the host already has them,
+and nothing installed in the sandbox can modify the host store. Concurrent sandbox sessions share the store
+and rely on Nix's locking. Avoid running garbage collection in one session while another is building.
+
+Nix runs with `sandbox = false`: builds execute directly as the container user rather than in Nix's per-build
+sandbox. The container remains the isolation boundary (read-only rootfs, no capabilities,
+`no-new-privileges`). Nix's own sandbox needs nested user/mount namespaces and a static sandbox shell that
+this image deliberately does not install, so `sandbox = true` is not supported. Other Nix settings can be
+overridden through a profile's `env`, for example a private substituter:
+
+```toml
+[profile.nix]
+features = ["Nix"]
+env = { NIX_CONFIG = "substituters = https://cache.example.org" }
+```
+
+`nix build`, `nix develop`, `nix run`, `nix flake check`, and `nix profile install` work against the
+workspace's flakes (the workspace's Git repository must track the flake files, as usual). Checks that need
+KVM -- for example NixOS VM tests -- cannot run.
+
+The store grows with packages and source builds; reclaim space with `nix-collect-garbage -d` inside a
+Nix-enabled sandbox, or delete `~/.local/share/opencode-sandbox/nix` while no Nix-enabled sandbox is running.
 
 ## The container user
 
@@ -245,7 +299,8 @@ What the default policy does:
   with a single catch-all `external_directory * -> allow`, covering the workspace, the tmpfs `/tmp`, the
   feature-toolchain homes and opencode's own dirs alike (`*` matches across `/`). Without it, headless agents
   (subagents, `opencode run`) are blocked instead of prompted on every external path. The toolchain homes
-  (`CARGO_HOME` registry index and crate sources, R's XDG dirs, `/opencode/cache/opencode`) are build cache
+  (`CARGO_HOME` registry index and crate sources, R's XDG dirs, the Nix store/cache/state,
+  `/opencode/cache/opencode`) are build cache
   and need no per-path rules.
 - **Plan mode keeps its scratch.** The built-in `plan` agent denies all edits except opencode plan files. The
   seed adds a global `edit /tmp/* -> allow` rule (global rules run after the agent's built-in defaults, so it
@@ -379,6 +434,7 @@ Notes:
 opencode-sandbox                          # run in the current directory
 opencode-sandbox -p myenv                 # use a profile
 opencode-sandbox --feature Rust           # enable Rust toolchain for this run
+opencode-sandbox --feature Nix            # enable Nix (flakes, nix build, nix develop)
 opencode-sandbox --edit-config            # edit existing config in-container; sync back on exit
 opencode-sandbox -P 8080 serve            # run `serve` (headless API + web), passing remaining args to opencode
 ```

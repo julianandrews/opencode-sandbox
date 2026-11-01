@@ -9,6 +9,7 @@ use std::str::FromStr;
 pub enum Feature {
     R,
     Rust,
+    Nix,
 }
 
 impl std::fmt::Display for Feature {
@@ -16,6 +17,7 @@ impl std::fmt::Display for Feature {
         match self {
             Feature::R => write!(f, "R"),
             Feature::Rust => write!(f, "Rust"),
+            Feature::Nix => write!(f, "Nix"),
         }
     }
 }
@@ -26,7 +28,8 @@ impl FromStr for Feature {
         match s {
             "R" => Ok(Feature::R),
             "Rust" => Ok(Feature::Rust),
-            _ => Err(format!("unknown feature '{s}', expected R or Rust")),
+            "Nix" => Ok(Feature::Nix),
+            _ => Err(format!("unknown feature '{s}', expected R, Rust or Nix")),
         }
     }
 }
@@ -245,8 +248,10 @@ mod tests {
     fn feature_from_str() {
         assert_eq!("R".parse::<Feature>().unwrap(), Feature::R);
         assert_eq!("Rust".parse::<Feature>().unwrap(), Feature::Rust);
+        assert_eq!("Nix".parse::<Feature>().unwrap(), Feature::Nix);
         assert!("r".parse::<Feature>().is_err());
         assert!("rust".parse::<Feature>().is_err());
+        assert!("nix".parse::<Feature>().is_err());
         assert!("Python".parse::<Feature>().is_err());
     }
 
@@ -258,6 +263,9 @@ mod tests {
         let rust =
             Feature::deserialize(StrDeserializer::<serde::de::value::Error>::new("Rust")).unwrap();
         assert_eq!(rust, Feature::Rust);
+        let nix =
+            Feature::deserialize(StrDeserializer::<serde::de::value::Error>::new("Nix")).unwrap();
+        assert_eq!(nix, Feature::Nix);
     }
 
     #[test]
@@ -272,7 +280,7 @@ mod tests {
     fn config_with_build_variants() {
         let toml_str = r#"
 [build]
-variants = [["R"], ["Rust"], ["R", "Rust"]]
+variants = [["R"], ["Rust"], ["Nix"], ["R", "Rust", "Nix"]]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
@@ -280,7 +288,8 @@ variants = [["R"], ["Rust"], ["R", "Rust"]]
             vec![
                 vec![Feature::R],
                 vec![Feature::Rust],
-                vec![Feature::R, Feature::Rust],
+                vec![Feature::Nix],
+                vec![Feature::R, Feature::Rust, Feature::Nix],
             ]
         );
     }
@@ -313,6 +322,7 @@ base_image = "ghcr.io/anomalyco/opencode:beta"
     #[test]
     fn image_name_for_single() {
         assert_eq!(image_name_for(&[Feature::Rust]), "opencode-sandbox-rust");
+        assert_eq!(image_name_for(&[Feature::Nix]), "opencode-sandbox-nix");
     }
 
     #[test]
@@ -325,6 +335,14 @@ base_image = "ghcr.io/anomalyco/opencode:beta"
             image_name_for(&[Feature::R, Feature::Rust]),
             "opencode-sandbox-r-rust"
         );
+        assert_eq!(
+            image_name_for(&[Feature::Nix, Feature::Rust, Feature::R]),
+            image_name_for(&[Feature::R, Feature::Nix, Feature::Rust]),
+        );
+        assert_eq!(
+            image_name_for(&[Feature::Nix, Feature::Rust, Feature::R]),
+            "opencode-sandbox-r-rust-nix"
+        );
     }
 
     #[test]
@@ -332,6 +350,10 @@ base_image = "ghcr.io/anomalyco/opencode:beta"
         assert_eq!(
             image_name_for(&[Feature::R, Feature::Rust, Feature::R]),
             "opencode-sandbox-r-rust",
+        );
+        assert_eq!(
+            image_name_for(&[Feature::Nix, Feature::Nix]),
+            "opencode-sandbox-nix",
         );
     }
 
